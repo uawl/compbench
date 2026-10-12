@@ -1,0 +1,6 @@
+(program
+  (fn main () (call maximum 0 0))
+  (fn maximum (i acc)
+    (if (eq i len) acc
+      (let x (get i)
+        (call maximum (add i 1) (if (gt x acc) x acc))))))

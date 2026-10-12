@@ -1,0 +1,8 @@
+(program
+  (fn main () (call even_step 0 0))
+  (fn even_step (i acc)
+    (if (eq i len) acc
+      (call odd_step (add i 1) (add acc (get i)))))
+  (fn odd_step (i acc)
+    (if (eq i len) acc
+      (call even_step (add i 1) (xor acc (get i))))))

@@ -1,0 +1,2435 @@
+#include "ast.h"
+
+#include <errno.h>
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAX_IR_FUNCS 128
+#define MAX_IR_NODES 65536
+#define MAX_IR_LOCALS 128
+
+typedef struct IrExpr {
+    CbOp op;
+    uint64_t value;
+    int index;
+    int argc;
+    int has_call;
+    int size;
+    struct IrExpr *arg[CB_MAX_PARAMS];
+} IrExpr;
+
+typedef struct {
+    int arity;
+    int locals;
+    IrExpr *body;
+} IrFunction;
+
+typedef struct {
+    IrFunction fn[MAX_IR_FUNCS];
+    int functions;
+    int entry;
+    int nodes;
+    IrExpr pool[MAX_IR_NODES];
+} IrProgram;
+
+enum {
+    REG_RAX = 0, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+    REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15,
+    REG_NONE = -1
+};
+
+static const char *const reg64_name[16] = {
+    "%rax", "%rcx", "%rdx", "%rbx", "%rsp", "%rbp", "%rsi", "%rdi",
+    "%r8",  "%r9",  "%r10", "%r11", "%r12", "%r13", "%r14", "%r15"
+};
+
+static const char *const reg32_name[16] = {
+    "%eax",  "%ecx",  "%edx",  "%ebx",  "%esp",  "%ebp",  "%esi",  "%edi",
+    "%r8d",  "%r9d",  "%r10d", "%r11d", "%r12d", "%r13d", "%r14d", "%r15d"
+};
+
+static const int param_regs[4] = { REG_RDI, REG_RSI, REG_R8, REG_R9 };
+
+static int fits_imm32_s(uint64_t v) {
+    return (uint64_t)(int64_t)(int32_t)v == v;
+}
+
+static int is_pow2_u64(uint64_t v, int *shift_out) {
+    if (v == 0 || (v & (v - 1)) != 0) return 0;
+    int s = 0;
+    while ((v >> s) != 1) ++s;
+    *shift_out = s;
+    return 1;
+}
+
+static void compute_magic_div_u64(uint64_t d, uint64_t *m_out, int *l_out) {
+    int l = 0;
+    while (l < 64 && (1ULL << l) < d) ++l;
+    uint64_t two_l_minus_d = (l == 64) ? (0ULL - d) : ((1ULL << l) - d);
+    unsigned __int128 num = ((unsigned __int128)two_l_minus_d) << 64;
+    *m_out = (uint64_t)(num / d + 1);
+    *l_out = l;
+}
+
+static IrExpr *alloc_node(IrProgram *p, CbOp op) {
+    if (p->nodes >= MAX_IR_NODES) return NULL;
+    IrExpr *e = &p->pool[p->nodes++];
+    memset(e, 0, sizeof(*e));
+    e->op = op;
+    e->size = 1;
+    return e;
+}
+
+static IrExpr * alloc_const(IrProgram *p, uint64_t val) {
+    IrExpr *e = alloc_node(p, CB_CONST);
+    if (e) e->value = val;
+    return e;
+}
+
+static IrExpr *copy_from_cb(IrProgram *p, const CbExpr *src) {
+    if (!src) return NULL;
+    IrExpr *e = alloc_node(p, src->op);
+    if (!e) return NULL;
+    e->value = src->value;
+    e->index = src->index;
+    e->argc = src->argc;
+    int nchild = 0;
+    if (src->op == CB_GET) nchild = 1;
+    else if (src->op == CB_IF) nchild = 3;
+    else if (src->op == CB_LET) nchild = 2;
+    else if (src->op == CB_CALL) nchild = src->argc;
+    else if (src->op >= CB_ADD) nchild = 2;
+    for (int i = 0; i < nchild; ++i) {
+        e->arg[i] = copy_from_cb(p, src->arg[i]);
+        if (!e->arg[i]) return NULL;
+    }
+    return e;
+}
+
+static IrExpr *clone_ir(IrProgram *p, const IrExpr *src, int slot_offset, int param_arity) {
+    if (!src) return NULL;
+    IrExpr *e = alloc_node(p, src->op);
+    if (!e) return NULL;
+    e->value = src->value;
+    e->index = src->index;
+    e->argc = src->argc;
+    if (src->op == CB_VAR || src->op == CB_LET) {
+        if (src->index >= param_arity) e->index = src->index + slot_offset;
+    }
+    int nchild = 0;
+    if (src->op == CB_GET) nchild = 1;
+    else if (src->op == CB_IF) nchild = 3;
+    else if (src->op == CB_LET) nchild = 2;
+    else if (src->op == CB_CALL) nchild = src->argc;
+    else if (src->op >= CB_ADD) nchild = 2;
+    for (int i = 0; i < nchild; ++i) {
+        e->arg[i] = clone_ir(p, src->arg[i], slot_offset, param_arity);
+        if (!e->arg[i]) return NULL;
+    }
+    return e;
+}
+
+static void update_meta(IrExpr *e) {
+    if (!e) return;
+    int nchild = 0;
+    if (e->op == CB_GET) nchild = 1;
+    else if (e->op == CB_IF) nchild = 3;
+    else if (e->op == CB_LET) nchild = 2;
+    else if (e->op == CB_CALL) nchild = e->argc;
+    else if (e->op >= CB_ADD) nchild = 2;
+    int hc = (e->op == CB_CALL) ? 1 : 0;
+    int sz = 1;
+    for (int i = 0; i < nchild; ++i) {
+        update_meta(e->arg[i]);
+        if (e->arg[i]->has_call) hc = 1;
+        sz += e->arg[i]->size;
+    }
+    e->has_call = hc;
+    e->size = sz;
+}
+
+static int expr_eq(const IrExpr *a, const IrExpr *b) {
+    if (a == b) return 1;
+    if (!a || !b || a->op != b->op) return 0;
+    if (a->op == CB_CONST) return a->value == b->value;
+    if (a->op == CB_VAR) return a->index == b->index;
+    if (a->op == CB_LEN) return 1;
+    if (a->op == CB_GET) return expr_eq(a->arg[0], b->arg[0]);
+    if (a->op == CB_IF)
+        return expr_eq(a->arg[0], b->arg[0]) && expr_eq(a->arg[1], b->arg[1]) && expr_eq(a->arg[2], b->arg[2]);
+    if (a->op == CB_LET)
+        return a->index == b->index && expr_eq(a->arg[0], b->arg[0]) && expr_eq(a->arg[1], b->arg[1]);
+    if (a->op == CB_CALL) {
+        if (a->index != b->index || a->argc != b->argc) return 0;
+        for (int i = 0; i < a->argc; ++i)
+            if (!expr_eq(a->arg[i], b->arg[i])) return 0;
+        return 1;
+    }
+    return expr_eq(a->arg[0], b->arg[0]) && expr_eq(a->arg[1], b->arg[1]);
+}
+
+static int count_var_uses(const IrExpr *e, int slot) {
+    if (!e) return 0;
+    if (e->op == CB_VAR) return e->index == slot ? 1 : 0;
+    int nchild = 0;
+    if (e->op == CB_GET) nchild = 1;
+    else if (e->op == CB_IF) nchild = 3;
+    else if (e->op == CB_LET) nchild = 2;
+    else if (e->op == CB_CALL) nchild = e->argc;
+    else if (e->op >= CB_ADD) nchild = 2;
+    int c = 0;
+    for (int i = 0; i < nchild; ++i) c += count_var_uses(e->arg[i], slot);
+    return c;
+}
+
+static uint64_t eval_const_binop(CbOp op, uint64_t a, uint64_t b) {
+    switch (op) {
+    case CB_ADD: return a + b;
+    case CB_SUB: return a - b;
+    case CB_MUL: return a * b;
+    case CB_DIV: return b == 0 ? 0 : a / b;
+    case CB_MOD: return b == 0 ? 0 : a % b;
+    case CB_AND: return a & b;
+    case CB_OR:  return a | b;
+    case CB_XOR: return a ^ b;
+    case CB_SHL: return a << (b & 63);
+    case CB_SHR: return a >> (b & 63);
+    case CB_EQ:  return a == b;
+    case CB_NE:  return a != b;
+    case CB_LT:  return a < b;
+    case CB_LE:  return a <= b;
+    case CB_GT:  return a > b;
+    case CB_GE:  return a >= b;
+    default: return 0;
+    }
+}
+
+static IrExpr *simplify_expr(IrProgram *p, IrExpr *e, IrExpr **env) {
+    if (!e) return NULL;
+    if (e->op == CB_VAR) {
+        if (e->index >= 0 && e->index < MAX_IR_LOCALS && env[e->index]) {
+            IrExpr *rep = clone_ir(p, env[e->index], 0, MAX_IR_LOCALS);
+            if (rep) { update_meta(rep); return rep; }
+        }
+        e->has_call = 0; e->size = 1;
+        return e;
+    }
+    if (e->op == CB_CONST || e->op == CB_LEN) {
+        e->has_call = 0; e->size = 1;
+        return e;
+    }
+    if (e->op == CB_LET) {
+        e->arg[0] = simplify_expr(p, e->arg[0], env);
+        IrExpr *val = e->arg[0];
+        int slot = e->index;
+        int uses = count_var_uses(e->arg[1], slot);
+        if (uses == 0 && !val->has_call) {
+            return simplify_expr(p, e->arg[1], env);
+        }
+        int inline_ok = (val->op == CB_CONST || val->op == CB_VAR || val->op == CB_LEN);
+        if (!inline_ok && !val->has_call && val->size <= 4 && val->op != CB_DIV && val->op != CB_MOD && val->op != CB_GET && uses <= 2) {
+            inline_ok = 1;
+        }
+        if (inline_ok && slot >= 0 && slot < MAX_IR_LOCALS && p->nodes + val->size * uses + 64 < MAX_IR_NODES) {
+            IrExpr *old = env[slot];
+            env[slot] = val;
+            IrExpr *res = simplify_expr(p, e->arg[1], env);
+            env[slot] = old;
+            return res;
+        }
+        e->arg[1] = simplify_expr(p, e->arg[1], env);
+        update_meta(e);
+        return e;
+    }
+    if (e->op == CB_IF) {
+        e->arg[0] = simplify_expr(p, e->arg[0], env);
+        if (e->arg[0]->op == CB_CONST) {
+            return simplify_expr(p, e->arg[0]->value ? e->arg[1] : e->arg[2], env);
+        }
+        e->arg[1] = simplify_expr(p, e->arg[1], env);
+        e->arg[2] = simplify_expr(p, e->arg[2], env);
+        if (expr_eq(e->arg[1], e->arg[2]) && !e->arg[0]->has_call) {
+            return e->arg[1];
+        }
+        update_meta(e);
+        return e;
+    }
+    if (e->op == CB_GET) {
+        e->arg[0] = simplify_expr(p, e->arg[0], env);
+        update_meta(e);
+        return e;
+    }
+    if (e->op == CB_CALL) {
+        for (int i = 0; i < e->argc; ++i) e->arg[i] = simplify_expr(p, e->arg[i], env);
+        update_meta(e);
+        return e;
+    }
+    e->arg[0] = simplify_expr(p, e->arg[0], env);
+    e->arg[1] = simplify_expr(p, e->arg[1], env);
+    IrExpr *a = e->arg[0], *b = e->arg[1];
+    if (a->op == CB_CONST && b->op == CB_CONST) {
+        e->op = CB_CONST;
+        e->value = eval_const_binop(e->op, a->value, b->value);
+        e->has_call = 0; e->size = 1;
+        return e;
+    }
+    if (a->op == CB_CONST && (e->op == CB_ADD || e->op == CB_MUL || e->op == CB_AND ||
+                              e->op == CB_OR  || e->op == CB_XOR || e->op == CB_EQ  || e->op == CB_NE)) {
+        IrExpr *tmp = a; a = b; b = tmp;
+        e->arg[0] = a; e->arg[1] = b;
+    }
+    if (b->op == CB_CONST) {
+        uint64_t v = b->value;
+        int sh = 0;
+        switch (e->op) {
+        case CB_ADD: case CB_SUB: case CB_OR: case CB_XOR:
+            if (v == 0) return a;
+            break;
+        case CB_SHL: case CB_SHR:
+            if ((v & 63) == 0) return a;
+            break;
+        case CB_MUL:
+            if (v == 1) return a;
+            if (v == 0 && !a->has_call) return b;
+            if (is_pow2_u64(v, &sh)) { e->op = CB_SHL; b->value = (uint64_t)sh; }
+            break;
+        case CB_DIV:
+            if (v == 1) return a;
+            if (v == 0 && !a->has_call) return b;
+            if (is_pow2_u64(v, &sh)) { e->op = CB_SHR; b->value = (uint64_t)sh; }
+            break;
+        case CB_MOD:
+            if ((v == 0 || v == 1) && !a->has_call) { b->value = 0; return b; }
+            if (is_pow2_u64(v, &sh)) { e->op = CB_AND; b->value = v - 1; }
+            break;
+        case CB_AND:
+            if (v == 0 && !a->has_call) return b;
+            if (v == ~0ULL) return a;
+            break;
+        default: break;
+        }
+    }
+    if (!a->has_call && expr_eq(a, b)) {
+        if (e->op == CB_SUB || e->op == CB_XOR || e->op == CB_NE || e->op == CB_LT || e->op == CB_GT) {
+            e->op = CB_CONST; e->value = 0; e->has_call = 0; e->size = 1; return e;
+        }
+        if (e->op == CB_EQ || e->op == CB_LE || e->op == CB_GE) {
+            e->op = CB_CONST; e->value = 1; e->has_call = 0; e->size = 1; return e;
+        }
+        if (e->op == CB_AND || e->op == CB_OR) return a;
+    }
+    update_meta(e);
+    return e;
+}
+
+static void simplify_fn(IrProgram *p, int fn_idx) {
+    IrExpr *env[MAX_IR_LOCALS];
+    memset(env, 0, sizeof(env));
+    p->fn[fn_idx].body = simplify_expr(p, p->fn[fn_idx].body, env);
+    update_meta(p->fn[fn_idx].body);
+}
+
+static int calls_only_target(const IrExpr *e, int target_fn, int *call_count) {
+    if (!e) return 1;
+    if (e->op == CB_CALL) {
+        if (e->index != target_fn) return 0;
+        (*call_count)++;
+        for (int i = 0; i < e->argc; ++i)
+            if (!calls_only_target(e->arg[i], target_fn, call_count)) return 0;
+        return 1;
+    }
+    int nchild = 0;
+    if (e->op == CB_GET) nchild = 1;
+    else if (e->op == CB_IF) nchild = 3;
+    else if (e->op == CB_LET) nchild = 2;
+    else if (e->op >= CB_ADD) nchild = 2;
+    for (int i = 0; i < nchild; ++i)
+        if (!calls_only_target(e->arg[i], target_fn, call_count)) return 0;
+    return 1;
+}
+
+static IrExpr *inline_calls_in_expr(IrProgram *p, int caller_idx, IrExpr *e, int allow_mutual, int *changed) {
+    if (!e) return NULL;
+    int nchild = 0;
+    if (e->op == CB_GET) nchild = 1;
+    else if (e->op == CB_IF) nchild = 3;
+    else if (e->op == CB_LET) nchild = 2;
+    else if (e->op == CB_CALL) nchild = e->argc;
+    else if (e->op >= CB_ADD) nchild = 2;
+    for (int i = 0; i < nchild; ++i) {
+        e->arg[i] = inline_calls_in_expr(p, caller_idx, e->arg[i], allow_mutual, changed);
+    }
+    if (e->op == CB_CALL && e->index != caller_idx) {
+        int callee_idx = e->index;
+        IrFunction *caller = &p->fn[caller_idx];
+        IrFunction *callee = &p->fn[callee_idx];
+        int can_inline = 0;
+        if (!callee->body->has_call && callee->body->size <= 100) {
+            can_inline = 1;
+        } else if (allow_mutual && callee->body->size <= 64) {
+            int cnt = 0;
+            if (calls_only_target(callee->body, caller_idx, &cnt) && cnt <= 2) can_inline = 1;
+        }
+        if (can_inline && caller->locals + callee->locals <= MAX_IR_LOCALS &&
+            p->nodes + callee->body->size + 16 < MAX_IR_NODES) {
+            int base = caller->locals;
+            caller->locals += callee->locals;
+            IrExpr *cloned = clone_ir(p, callee->body, base, 0);
+            if (cloned) {
+                for (int j = callee->arity - 1; j >= 0; --j) {
+                    IrExpr *let_n = alloc_node(p, CB_LET);
+                    if (!let_n) return e;
+                    let_n->index = base + j;
+                    let_n->arg[0] = e->arg[j];
+                    let_n->arg[1] = cloned;
+                    cloned = let_n;
+                }
+                *changed = 1;
+                update_meta(cloned);
+                return cloned;
+            }
+        }
+    }
+    update_meta(e);
+    return e;
+}
+
+static int is_self_tail_only(const IrExpr *e, int fn_idx, int in_tail, int *self_calls) {
+    if (!e) return 1;
+    if (e->op == CB_CALL) {
+        if (!in_tail || e->index != fn_idx) return 0;
+        (*self_calls)++;
+        for (int i = 0; i < e->argc; ++i)
+            if (!is_self_tail_only(e->arg[i], fn_idx, 0, self_calls)) return 0;
+        return 1;
+    }
+    if (e->op == CB_IF) {
+        if (!is_self_tail_only(e->arg[0], fn_idx, 0, self_calls)) return 0;
+        return is_self_tail_only(e->arg[1], fn_idx, in_tail, self_calls) &&
+               is_self_tail_only(e->arg[2], fn_idx, in_tail, self_calls);
+    }
+    if (e->op == CB_LET) {
+        if (!is_self_tail_only(e->arg[0], fn_idx, 0, self_calls)) return 0;
+        return is_self_tail_only(e->arg[1], fn_idx, in_tail, self_calls);
+    }
+    int nchild = (e->op == CB_GET) ? 1 : (e->op >= CB_ADD ? 2 : 0);
+    for (int i = 0; i < nchild; ++i)
+        if (!is_self_tail_only(e->arg[i], fn_idx, 0, self_calls)) return 0;
+    return 1;
+}
+
+static int is_assoc_op(CbOp op, uint64_t *ident_out) {
+    switch (op) {
+    case CB_ADD: case CB_OR: case CB_XOR: *ident_out = 0; return 1;
+    case CB_MUL: *ident_out = 1; return 1;
+    case CB_AND: *ident_out = ~0ULL; return 1;
+    default: return 0;
+    }
+}
+
+static void convert_linear_rec_to_loop(IrProgram *p) {
+    int orig_funcs = p->functions;
+    for (int i = 0; i < orig_funcs; ++i) {
+        IrFunction *fn = &p->fn[i];
+        if (fn->arity >= CB_MAX_PARAMS || p->functions >= MAX_IR_FUNCS) continue;
+        IrExpr *cur = fn->body;
+        while (cur && cur->op == CB_LET && !cur->arg[0]->has_call) cur = cur->arg[1];
+        if (!cur || cur->op != CB_IF || cur->arg[0]->has_call) continue;
+        IrExpr *t = cur->arg[1], *f = cur->arg[2];
+        int t_has = t->has_call, f_has = f->has_call;
+        if (t_has == f_has) continue;
+        IrExpr *rec_br = t_has ? t : f;
+        while (rec_br && rec_br->op == CB_LET && !rec_br->arg[0]->has_call) rec_br = rec_br->arg[1];
+        if (!rec_br) continue;
+        uint64_t ident = 0;
+        if (!is_assoc_op(rec_br->op, &ident)) continue;
+        IrExpr *lhs = rec_br->arg[0], *rhs = rec_br->arg[1];
+        IrExpr *call_e = NULL, *val_e = NULL;
+        if (rhs->op == CB_CALL && rhs->index == i && !lhs->has_call) {
+            call_e = rhs; val_e = lhs;
+        } else if (lhs->op == CB_CALL && lhs->index == i && !rhs->has_call) {
+            call_e = lhs; val_e = rhs;
+        }
+        if (!call_e) continue;
+        int args_ok = 1;
+        for (int a = 0; a < call_e->argc; ++a)
+            if (call_e->arg[a]->has_call) args_ok = 0;
+        if (!args_ok || fn->locals + 2 > MAX_IR_LOCALS || p->nodes + fn->body->size + 32 >= MAX_IR_NODES) continue;
+
+        int new_fn_idx = p->functions++;
+        int acc_slot = fn->arity;
+        IrFunction *nfn = &p->fn[new_fn_idx];
+        nfn->arity = fn->arity + 1;
+        nfn->locals = fn->locals + 1;
+        nfn->body = clone_ir(p, fn->body, 1, fn->arity);
+        if (!nfn->body) { p->functions--; continue; }
+
+        IrExpr *ncur = nfn->body;
+        while (ncur && ncur->op == CB_LET) ncur = ncur->arg[1];
+        IrExpr **exit_ptr = t_has ? &ncur->arg[2] : &ncur->arg[1];
+        IrExpr **rec_ptr  = t_has ? &ncur->arg[1] : &ncur->arg[2];
+
+        IrExpr *acc_var1 = alloc_node(p, CB_VAR);
+        acc_var1->index = acc_slot;
+        IrExpr *comb_exit = alloc_node(p, rec_br->op);
+        comb_exit->arg[0] = acc_var1;
+        comb_exit->arg[1] = *exit_ptr;
+        *exit_ptr = comb_exit;
+
+        IrExpr **rptr = rec_ptr;
+        while ((*rptr)->op == CB_LET) rptr = &(*rptr)->arg[1];
+        IrExpr *rop = *rptr;
+        IrExpr *rcall = (rop->arg[1]->op == CB_CALL && rop->arg[1]->index == i) ? rop->arg[1] : rop->arg[0];
+        IrExpr *rval  = (rcall == rop->arg[1]) ? rop->arg[0] : rop->arg[1];
+
+        IrExpr *acc_var2 = alloc_node(p, CB_VAR);
+        acc_var2->index = acc_slot;
+        IrExpr *comb_step = alloc_node(p, rop->op);
+        comb_step->arg[0] = acc_var2;
+        comb_step->arg[1] = rval;
+
+        rcall->index = new_fn_idx;
+        rcall->arg[rcall->argc++] = comb_step;
+        *rptr = rcall;
+
+        IrExpr *entry_call = alloc_node(p, CB_CALL);
+        entry_call->index = new_fn_idx;
+        entry_call->argc = fn->arity + 1;
+        for (int a = 0; a < fn->arity; ++a) {
+            IrExpr *v = alloc_node(p, CB_VAR);
+            v->index = a;
+            entry_call->arg[a] = v;
+        }
+        entry_call->arg[fn->arity] = alloc_const(p, ident);
+        fn->body = entry_call;
+        simplify_fn(p, new_fn_idx);
+        simplify_fn(p, i);
+    }
+}
+
+static IrExpr *wrap_lets_for_arg(IrProgram *p, const IrExpr *branch, int arg_idx) {
+    if (branch->op == CB_CALL) return clone_ir(p, branch->arg[arg_idx], 0, MAX_IR_LOCALS);
+    if (branch->op == CB_LET) {
+        IrExpr *inner = wrap_lets_for_arg(p, branch->arg[1], arg_idx);
+        if (!inner) return NULL;
+        if (count_var_uses(inner, branch->index) == 0) return inner;
+        IrExpr *l = alloc_node(p, CB_LET);
+        if (!l) return NULL;
+        l->index = branch->index;
+        l->arg[0] = clone_ir(p, branch->arg[0], 0, MAX_IR_LOCALS);
+        l->arg[1] = inner;
+        return l;
+    }
+    return NULL;
+}
+
+static int ends_in_self_call(const IrExpr *e, int fn_idx, const IrExpr **call_out) {
+    while (e && e->op == CB_LET) {
+        if (e->arg[0]->has_call) return 0;
+        e = e->arg[1];
+    }
+    if (e && e->op == CB_CALL && e->index == fn_idx && !e->arg[0]->has_call) {
+        for (int i = 0; i < e->argc; ++i)
+            if (e->arg[i]->has_call) return 0;
+        *call_out = e;
+        return 1;
+    }
+    return 0;
+}
+
+static IrExpr *merge_branch_tail_calls(IrProgram *p, int fn_idx, IrExpr *e) {
+    if (!e) return NULL;
+    if (e->op == CB_LET) {
+        e->arg[1] = merge_branch_tail_calls(p, fn_idx, e->arg[1]);
+        update_meta(e);
+        return e;
+    }
+    if (e->op == CB_IF) {
+        e->arg[1] = merge_branch_tail_calls(p, fn_idx, e->arg[1]);
+        e->arg[2] = merge_branch_tail_calls(p, fn_idx, e->arg[2]);
+        const IrExpr *c1 = NULL, *c2 = NULL;
+        if (!e->arg[0]->has_call &&
+            ends_in_self_call(e->arg[1], fn_idx, &c1) &&
+            ends_in_self_call(e->arg[2], fn_idx, &c2) &&
+            p->fn[fn_idx].locals + 1 <= MAX_IR_LOCALS &&
+            p->nodes + e->size * 2 + 32 < MAX_IR_NODES) {
+            int cond_slot = p->fn[fn_idx].locals++;
+            IrExpr *let_c = alloc_node(p, CB_LET);
+            IrExpr *ncall = alloc_node(p, CB_CALL);
+            if (let_c && ncall) {
+                ncall->index = fn_idx;
+                ncall->argc = c1->argc;
+                for (int j = 0; j < c1->argc; ++j) {
+                    IrExpr *tj = wrap_lets_for_arg(p, e->arg[1], j);
+                    IrExpr *fj = wrap_lets_for_arg(p, e->arg[2], j);
+                    if (expr_eq(tj, fj)) {
+                        ncall->arg[j] = tj;
+                    } else {
+                        IrExpr *if_j = alloc_node(p, CB_IF);
+                        IrExpr *cv = alloc_node(p, CB_VAR);
+                        cv->index = cond_slot;
+                        if_j->arg[0] = cv;
+                        if_j->arg[1] = tj;
+                        if_j->arg[2] = fj;
+                        ncall->arg[j] = if_j;
+                    }
+                }
+                let_c->index = cond_slot;
+                let_c->arg[0] = e->arg[0];
+                let_c->arg[1] = ncall;
+                update_meta(let_c);
+                return let_c;
+            }
+        }
+        update_meta(e);
+        return e;
+    }
+    return e;
+}
+
+typedef enum {
+    RED_NONE = 0,
+    RED_INVARIANT,
+    RED_ADD,
+    RED_SUB,
+    RED_XOR,
+    RED_OR,
+    RED_AND,
+    RED_MUL,
+    RED_MAX,
+    RED_MIN,
+    RED_AFFINE
+} RedKind;
+
+typedef struct {
+    RedKind kind;
+    IrExpr *rhs;
+    uint64_t affine_c;
+} AccInfo;
+
+typedef struct {
+    FILE *out;
+    const IrProgram *prog;
+    const IrFunction *fn;
+    int fn_idx;
+    int is_leaf_loop;
+    unsigned label;
+    int local_reg[MAX_IR_LOCALS];
+    int local_stack_slot[MAX_IR_LOCALS];
+    int scratch_regs[12];
+    int num_scratch;
+    int call_safe_regs[4];
+    int num_call_safe;
+    int used_callee[3];
+    int base_stack_slots;
+    int max_spill_slots;
+    int frame_sub_bytes;
+    int has_frame;
+    uint8_t in_bounds_var[MAX_IR_LOCALS];
+    int unroll_in_bounds_param;
+    int right_spine_loop;
+    CbOp right_spine_op;
+    int right_spine_reg;
+} FnEmit;
+
+static void emit_load_const(FILE *f, uint64_t v, int reg) {
+    if (v == 0) {
+        fprintf(f, "  xorl %s, %s\n", reg32_name[reg], reg32_name[reg]);
+    } else if (v <= 0xFFFFFFFFULL) {
+        fprintf(f, "  movl $%" PRIu64 ", %s\n", v, reg32_name[reg]);
+    } else if (fits_imm32_s(v)) {
+        fprintf(f, "  movq $%" PRId64 ", %s\n", (int64_t)v, reg64_name[reg]);
+    } else {
+        fprintf(f, "  movabsq $0x%016" PRIx64 ", %s\n", v, reg64_name[reg]);
+    }
+}
+
+static int stack_offset_for_slot(const FnEmit *s, int slot_idx) {
+    int pushed = s->used_callee[0] + s->used_callee[1] + s->used_callee[2];
+    return -8 * (pushed + 1 + slot_idx);
+}
+
+static void emit_load_local(const FnEmit *s, int v, int dst_reg) {
+    int r = s->local_reg[v];
+    if (r != REG_NONE) {
+        if (r != dst_reg) fprintf(s->out, "  movq %s, %s\n", reg64_name[r], reg64_name[dst_reg]);
+    } else {
+        fprintf(s->out, "  movq %d(%%rbp), %s\n", stack_offset_for_slot(s, s->local_stack_slot[v]), reg64_name[dst_reg]);
+    }
+}
+
+static void emit_store_local(const FnEmit *s, int src_reg, int v) {
+    int r = s->local_reg[v];
+    if (r != REG_NONE) {
+        if (r != src_reg) fprintf(s->out, "  movq %s, %s\n", reg64_name[src_reg], reg64_name[r]);
+    } else {
+        fprintf(s->out, "  movq %s, %d(%%rbp)\n", reg64_name[src_reg], stack_offset_for_slot(s, s->local_stack_slot[v]));
+    }
+}
+
+static int is_trivial_expr(const IrExpr *e) {
+    return e->op == CB_CONST || e->op == CB_VAR || e->op == CB_LEN;
+}
+
+static int is_get_var_with_offset(const IrExpr *e, int var_idx, uint64_t *off_out) {
+    if (e->op != CB_GET) return 0;
+    const IrExpr *idx = e->arg[0];
+    if (idx->op == CB_VAR && idx->index == var_idx) {
+        *off_out = 0;
+        return 1;
+    }
+    if (idx->op == CB_ADD && idx->arg[0]->op == CB_VAR && idx->arg[0]->index == var_idx &&
+        idx->arg[1]->op == CB_CONST && idx->arg[1]->value <= 16) {
+        *off_out = idx->arg[1]->value;
+        return 1;
+    }
+    return 0;
+}
+
+static void emit_expr(FnEmit *s, const IrExpr *e, int scratch_depth, int spill_depth);
+
+typedef enum { SRC_CONST, SRC_REG, SRC_STACK } MoveSrcKind;
+typedef struct {
+    MoveSrcKind kind;
+    uint64_t val;
+    int reg;
+    int stack_off;
+} MoveSrc;
+
+static void resolve_parallel_move_one(FILE *f, int i, int n, const int *dst_reg, MoveSrc *src, int *status, int temp_reg) {
+    status[i] = 1;
+    int d = dst_reg[i];
+    for (int j = 0; j < n; ++j) {
+        if (status[j] == 0 && src[j].kind == SRC_REG && src[j].reg == d) {
+            resolve_parallel_move_one(f, j, n, dst_reg, src, status, temp_reg);
+        }
+    }
+    int saved_to_temp = 0;
+    for (int j = 0; j < n; ++j) {
+        if (status[j] == 1 && src[j].kind == SRC_REG && src[j].reg == d) {
+            if (!saved_to_temp) {
+                fprintf(f, "  movq %s, %s\n", reg64_name[d], reg64_name[temp_reg]);
+                saved_to_temp = 1;
+            }
+            src[j].reg = temp_reg;
+        }
+    }
+    if (src[i].kind == SRC_CONST) {
+        emit_load_const(f, src[i].val, d);
+    } else if (src[i].kind == SRC_REG) {
+        if (src[i].reg != d) fprintf(f, "  movq %s, %s\n", reg64_name[src[i].reg], reg64_name[d]);
+    } else if (src[i].kind == SRC_STACK) {
+        fprintf(f, "  movq %d(%%rbp), %s\n", src[i].stack_off, reg64_name[d]);
+    }
+    status[i] = 2;
+}
+
+static void emit_parallel_moves(FILE *f, int n, const int *dst_reg, MoveSrc *src, int temp_reg) {
+    int status[4] = {0, 0, 0, 0};
+    for (int i = 0; i < n; ++i) {
+        if (dst_reg[i] == REG_NONE) status[i] = 2;
+        else if (src[i].kind == SRC_REG && src[i].reg == dst_reg[i]) status[i] = 2;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (status[i] == 0) resolve_parallel_move_one(f, i, n, dst_reg, src, status, temp_reg);
+    }
+}
+
+static MoveSrc make_trivial_src(const FnEmit *s, const IrExpr *e) {
+    MoveSrc m;
+    memset(&m, 0, sizeof(m));
+    if (e->op == CB_CONST) {
+        m.kind = SRC_CONST; m.val = e->value;
+    } else if (e->op == CB_LEN) {
+        m.kind = SRC_REG; m.reg = REG_R15;
+    } else if (e->op == CB_VAR) {
+        int r = s->local_reg[e->index];
+        if (r != REG_NONE) { m.kind = SRC_REG; m.reg = r; }
+        else { m.kind = SRC_STACK; m.stack_off = stack_offset_for_slot(s, s->local_stack_slot[e->index]); }
+    }
+    return m;
+}
+
+static void emit_call_args(FnEmit *s, const IrExpr *e, const int *target_regs, const int *target_stack_slots,
+                           int scratch_depth, int spill_depth) {
+    int argc = e->argc;
+    MoveSrc src[4];
+    memset(src, 0, sizeof(src));
+    int cur_scratch = scratch_depth;
+    int cur_spill = spill_depth;
+
+    int last_nontrivial = -1;
+    for (int i = 0; i < argc; ++i) {
+        if (!is_trivial_expr(e->arg[i])) last_nontrivial = i;
+    }
+
+    for (int i = 0; i < argc; ++i) {
+        const IrExpr *a = e->arg[i];
+        if (is_trivial_expr(a)) {
+            src[i] = make_trivial_src(s, a);
+            continue;
+        }
+        emit_expr(s, a, cur_scratch, cur_spill);
+        if (i == last_nontrivial) {
+            src[i].kind = SRC_REG;
+            src[i].reg = REG_RAX;
+        } else {
+            int later_has_call = 0;
+            for (int j = i + 1; j < argc; ++j)
+                if (e->arg[j]->has_call) later_has_call = 1;
+            if (!later_has_call && cur_scratch < s->num_scratch) {
+                int r = s->scratch_regs[cur_scratch++];
+                fprintf(s->out, "  movq %%rax, %s\n", reg64_name[r]);
+                src[i].kind = SRC_REG;
+                src[i].reg = r;
+            } else if (cur_spill < s->num_call_safe) {
+                int r = s->call_safe_regs[cur_spill++];
+                fprintf(s->out, "  movq %%rax, %s\n", reg64_name[r]);
+                src[i].kind = SRC_REG;
+                src[i].reg = r;
+            } else {
+                int sp_idx = s->base_stack_slots + (cur_spill++ - s->num_call_safe);
+                int off = stack_offset_for_slot(s, sp_idx);
+                fprintf(s->out, "  movq %%rax, %d(%%rbp)\n", off);
+                src[i].kind = SRC_STACK;
+                src[i].stack_off = off;
+            }
+        }
+    }
+
+    if (target_stack_slots) {
+        for (int i = 0; i < argc; ++i) {
+            if (target_regs[i] == REG_NONE) {
+                int dst_off = stack_offset_for_slot(s, target_stack_slots[i]);
+                if (src[i].kind == SRC_CONST) {
+                    emit_load_const(s->out, src[i].val, REG_RCX);
+                    fprintf(s->out, "  movq %%rcx, %d(%%rbp)\n", dst_off);
+                } else if (src[i].kind == SRC_REG) {
+                    fprintf(s->out, "  movq %s, %d(%%rbp)\n", reg64_name[src[i].reg], dst_off);
+                } else if (src[i].kind == SRC_STACK && src[i].stack_off != dst_off) {
+                    fprintf(s->out, "  movq %d(%%rbp), %%rcx\n  movq %%rcx, %d(%%rbp)\n", src[i].stack_off, dst_off);
+                }
+            }
+        }
+    }
+    emit_parallel_moves(s->out, argc, target_regs, src, REG_RCX);
+}
+
+static void emit_div_mod_const(FILE *f, uint64_t d, int is_mod) {
+    if (d == 0) {
+        fprintf(f, "  xorl %%eax, %%eax\n");
+        return;
+    }
+    int sh = 0;
+    if (is_pow2_u64(d, &sh)) {
+        if (is_mod) {
+            if (d == 1) fprintf(f, "  xorl %%eax, %%eax\n");
+            else if (fits_imm32_s(d - 1)) fprintf(f, "  andq $%" PRId64 ", %%rax\n", (int64_t)(d - 1));
+            else {
+                emit_load_const(f, d - 1, REG_RCX);
+                fprintf(f, "  andq %%rcx, %%rax\n");
+            }
+        } else {
+            if (sh > 0) fprintf(f, "  shrq $%d, %%rax\n", sh);
+        }
+        return;
+    }
+    uint64_t m = 0;
+    int l = 0;
+    compute_magic_div_u64(d, &m, &l);
+    fprintf(f, "  movq %%rax, %%rcx\n");
+    emit_load_const(f, m, REG_RAX);
+    fprintf(f, "  mulq %%rcx\n");
+    if (!is_mod) {
+        fprintf(f, "  movq %%rcx, %%rax\n  subq %%rdx, %%rax\n  shrq $1, %%rax\n  addq %%rdx, %%rax\n");
+        if (l > 1) fprintf(f, "  shrq $%d, %%rax\n", l - 1);
+    } else {
+        fprintf(f, "  movq %%rcx, %%rax\n  subq %%rdx, %%rax\n  shrq $1, %%rax\n  addq %%rdx, %%rax\n");
+        if (l > 1) fprintf(f, "  shrq $%d, %%rax\n", l - 1);
+        if (fits_imm32_s(d)) {
+            fprintf(f, "  imulq $%" PRId64 ", %%rax, %%rax\n", (int64_t)d);
+        } else {
+            emit_load_const(f, d, REG_RDX);
+            fprintf(f, "  imulq %%rdx, %%rax\n");
+        }
+        fprintf(f, "  subq %%rax, %%rcx\n  movq %%rcx, %%rax\n");
+    }
+}
+
+static void format_trivial_operand(const FnEmit *s, const IrExpr *e, char *buf, size_t bsz) {
+    if (e->op == CB_CONST && fits_imm32_s(e->value)) {
+        snprintf(buf, bsz, "$%" PRId64, (int64_t)e->value);
+    } else if (e->op == CB_LEN) {
+        snprintf(buf, bsz, "%%r15");
+    } else if (e->op == CB_VAR) {
+        int r = s->local_reg[e->index];
+        if (r != REG_NONE) snprintf(buf, bsz, "%s", reg64_name[r]);
+        else snprintf(buf, bsz, "%d(%%rbp)", stack_offset_for_slot(s, s->local_stack_slot[e->index]));
+    } else {
+        buf[0] = '\0';
+    }
+}
+
+static void emit_binop_rhs_op(FnEmit *s, CbOp op, const char *rhs_op) {
+    FILE *f = s->out;
+    switch (op) {
+    case CB_ADD: fprintf(f, "  addq %s, %%rax\n", rhs_op); break;
+    case CB_SUB: fprintf(f, "  subq %s, %%rax\n", rhs_op); break;
+    case CB_MUL: fprintf(f, "  imulq %s, %%rax\n", rhs_op); break;
+    case CB_AND: fprintf(f, "  andq %s, %%rax\n", rhs_op); break;
+    case CB_OR:  fprintf(f, "  orq %s, %%rax\n", rhs_op); break;
+    case CB_XOR: fprintf(f, "  xorq %s, %%rax\n", rhs_op); break;
+    default: {
+        static const char *const conds[] = {"e", "ne", "b", "be", "a", "ae"};
+        fprintf(f, "  cmpq %s, %%rax\n  set%s %%al\n  movzbl %%al, %%eax\n",
+                rhs_op, conds[op - CB_EQ]);
+        break;
+    }
+    }
+}
+
+static void emit_branch_if(FnEmit *s, const IrExpr *cond, int jump_if_true, unsigned target_label,
+                           int scratch_depth, int spill_depth) {
+    FILE *f = s->out;
+    if (cond->op >= CB_EQ && cond->op <= CB_GE) {
+        static const char *const jcc_true[]  = {"e",  "ne", "b",  "be", "a",  "ae"};
+        static const char *const jcc_false[] = {"ne", "e",  "ae", "a",  "be", "b"};
+        const char *cc = jump_if_true ? jcc_true[cond->op - CB_EQ] : jcc_false[cond->op - CB_EQ];
+        const IrExpr *a = cond->arg[0], *b = cond->arg[1];
+        char op_buf[64];
+        format_trivial_operand(s, b, op_buf, sizeof(op_buf));
+        if (op_buf[0] != '\0') {
+            emit_expr(s, a, scratch_depth, spill_depth);
+            fprintf(f, "  cmpq %s, %%rax\n  j%s .L%u\n", op_buf, cc, target_label);
+            return;
+        }
+    }
+    emit_expr(s, cond, scratch_depth, spill_depth);
+    fprintf(f, "  testq %%rax, %%rax\n  %s .L%u\n", jump_if_true ? "jnz" : "jz", target_label);
+}
+
+static int is_cmov_safe(const FnEmit *s, const IrExpr *e) {
+    if (!e || e->has_call || e->size > 4) return 0;
+    if (e->op == CB_DIV || e->op == CB_MOD) return e->arg[1]->op == CB_CONST && e->arg[1]->value != 0;
+    if (e->op == CB_GET) {
+        uint64_t off = 0;
+        if (s->unroll_in_bounds_param >= 0 && is_get_var_with_offset(e, s->unroll_in_bounds_param, &off)) return 1;
+        if (e->arg[0]->op == CB_VAR && s->in_bounds_var[e->arg[0]->index]) return 1;
+        return 0;
+    }
+    if (e->op == CB_IF || e->op == CB_LET) return 0;
+    if (e->op >= CB_ADD) return is_cmov_safe(s, e->arg[0]) && is_cmov_safe(s, e->arg[1]);
+    return 1;
+}
+
+static void check_if_bounds_var(const IrExpr *cond, int *var_true, int *var_false) {
+    *var_true = -1;
+    *var_false = -1;
+    if (cond->op == CB_LT && cond->arg[0]->op == CB_VAR && cond->arg[1]->op == CB_LEN)
+        *var_true = cond->arg[0]->index;
+    else if (cond->op == CB_GT && cond->arg[0]->op == CB_LEN && cond->arg[1]->op == CB_VAR)
+        *var_true = cond->arg[1]->index;
+    else if (cond->op == CB_GE && cond->arg[0]->op == CB_VAR && cond->arg[1]->op == CB_LEN)
+        *var_false = cond->arg[0]->index;
+    else if (cond->op == CB_LE && cond->arg[0]->op == CB_LEN && cond->arg[1]->op == CB_VAR)
+        *var_false = cond->arg[1]->index;
+}
+
+static void emit_expr(FnEmit *s, const IrExpr *e, int scratch_depth, int spill_depth) {
+    FILE *f = s->out;
+    switch (e->op) {
+    case CB_CONST:
+        emit_load_const(f, e->value, REG_RAX);
+        return;
+    case CB_VAR:
+        emit_load_local(s, e->index, REG_RAX);
+        return;
+    case CB_LEN:
+        fprintf(f, "  movq %%r15, %%rax\n");
+        return;
+    case CB_GET: {
+        uint64_t off = 0;
+        if (s->unroll_in_bounds_param >= 0 && is_get_var_with_offset(e, s->unroll_in_bounds_param, &off)) {
+            int r = s->local_reg[s->unroll_in_bounds_param];
+            if (r != REG_NONE) {
+                if (off == 0) fprintf(f, "  movq (%%r14,%s,8), %%rax\n", reg64_name[r]);
+                else fprintf(f, "  movq %" PRIu64 "(%%r14,%s,8), %%rax\n", off * 8, reg64_name[r]);
+                return;
+            }
+        }
+        if (e->arg[0]->op == CB_VAR && s->in_bounds_var[e->arg[0]->index]) {
+            int r = s->local_reg[e->arg[0]->index];
+            if (r != REG_NONE) {
+                fprintf(f, "  movq (%%r14,%s,8), %%rax\n", reg64_name[r]);
+                return;
+            }
+        }
+        unsigned lbl = s->label++;
+        emit_expr(s, e->arg[0], scratch_depth, spill_depth);
+        fprintf(f, "  cmpq %%r15, %%rax\n  jae .L%u\n  movq (%%r14,%%rax,8), %%rax\n  jmp .L%u_d\n"
+                   ".L%u:\n  xorl %%eax, %%eax\n.L%u_d:\n", lbl, lbl, lbl, lbl);
+        return;
+    }
+    case CB_LET:
+        emit_expr(s, e->arg[0], scratch_depth, spill_depth);
+        emit_store_local(s, REG_RAX, e->index);
+        emit_expr(s, e->arg[1], scratch_depth, spill_depth);
+        return;
+    case CB_IF: {
+        if (scratch_depth < s->num_scratch && is_cmov_safe(s, e->arg[1]) && is_cmov_safe(s, e->arg[2])) {
+            int treg = s->scratch_regs[scratch_depth];
+            emit_expr(s, e->arg[1], scratch_depth + 1, spill_depth);
+            fprintf(f, "  movq %%rax, %s\n", reg64_name[treg]);
+            emit_expr(s, e->arg[0], scratch_depth + 1, spill_depth);
+            fprintf(f, "  movq %%rax, %%rcx\n");
+            emit_expr(s, e->arg[2], scratch_depth + 1, spill_depth);
+            fprintf(f, "  testq %%rcx, %%rcx\n  cmovnzq %s, %%rax\n", reg64_name[treg]);
+            return;
+        }
+        unsigned else_lbl = s->label++;
+        unsigned done_lbl = s->label++;
+        int vt = -1, vf = -1;
+        check_if_bounds_var(e->arg[0], &vt, &vf);
+        emit_branch_if(s, e->arg[0], 0, else_lbl, scratch_depth, spill_depth);
+        uint8_t old_vt = (vt >= 0) ? s->in_bounds_var[vt] : 0;
+        if (vt >= 0) s->in_bounds_var[vt] = 1;
+        emit_expr(s, e->arg[1], scratch_depth, spill_depth);
+        if (vt >= 0) s->in_bounds_var[vt] = old_vt;
+        fprintf(f, "  jmp .L%u\n.L%u:\n", done_lbl, else_lbl);
+        uint8_t old_vf = (vf >= 0) ? s->in_bounds_var[vf] : 0;
+        if (vf >= 0) s->in_bounds_var[vf] = 1;
+        emit_expr(s, e->arg[2], scratch_depth, spill_depth);
+        if (vf >= 0) s->in_bounds_var[vf] = old_vf;
+        fprintf(f, ".L%u:\n", done_lbl);
+        return;
+    }
+    case CB_CALL:
+        emit_call_args(s, e, param_regs, NULL, scratch_depth, spill_depth);
+        fprintf(f, "  call .Lfn%d\n", e->index);
+        return;
+    default: break;
+    }
+
+    const IrExpr *a = e->arg[0], *b = e->arg[1];
+    if ((e->op == CB_DIV || e->op == CB_MOD) && b->op == CB_CONST) {
+        emit_expr(s, a, scratch_depth, spill_depth);
+        emit_div_mod_const(f, b->value, e->op == CB_MOD);
+        return;
+    }
+    if ((e->op == CB_SHL || e->op == CB_SHR) && b->op == CB_CONST) {
+        emit_expr(s, a, scratch_depth, spill_depth);
+        unsigned sh = (unsigned)(b->value & 63);
+        if (sh > 0) fprintf(f, "  %s $%u, %%rax\n", e->op == CB_SHL ? "shlq" : "shrq", sh);
+        return;
+    }
+
+    if ((e->op >= CB_ADD && e->op <= CB_MUL) || (e->op >= CB_AND && e->op <= CB_XOR) || (e->op >= CB_EQ && e->op <= CB_GE)) {
+        char op_buf[64];
+        format_trivial_operand(s, b, op_buf, sizeof(op_buf));
+        if (op_buf[0] != '\0') {
+            emit_expr(s, a, scratch_depth, spill_depth);
+            emit_binop_rhs_op(s, e->op, op_buf);
+            return;
+        }
+        uint64_t goff = 0;
+        if (s->unroll_in_bounds_param >= 0 && is_get_var_with_offset(b, s->unroll_in_bounds_param, &goff)) {
+            int r = s->local_reg[s->unroll_in_bounds_param];
+            if (r != REG_NONE) {
+                emit_expr(s, a, scratch_depth, spill_depth);
+                if (goff == 0) snprintf(op_buf, sizeof(op_buf), "(%%r14,%s,8)", reg64_name[r]);
+                else snprintf(op_buf, sizeof(op_buf), "%" PRIu64 "(%%r14,%s,8)", goff * 8, reg64_name[r]);
+                emit_binop_rhs_op(s, e->op, op_buf);
+                return;
+            }
+        }
+        if (b->op == CB_GET && b->arg[0]->op == CB_VAR && s->in_bounds_var[b->arg[0]->index]) {
+            int r = s->local_reg[b->arg[0]->index];
+            if (r != REG_NONE) {
+                emit_expr(s, a, scratch_depth, spill_depth);
+                snprintf(op_buf, sizeof(op_buf), "(%%r14,%s,8)", reg64_name[r]);
+                emit_binop_rhs_op(s, e->op, op_buf);
+                return;
+            }
+        }
+    }
+
+    if (is_trivial_expr(b)) {
+        emit_expr(s, a, scratch_depth, spill_depth);
+        if (b->op == CB_CONST) emit_load_const(f, b->value, REG_RCX);
+        else if (b->op == CB_LEN) fprintf(f, "  movq %%r15, %%rcx\n");
+        else emit_load_local(s, b->index, REG_RCX);
+    } else if (is_trivial_expr(a)) {
+        emit_expr(s, b, scratch_depth, spill_depth);
+        fprintf(f, "  movq %%rax, %%rcx\n");
+        if (a->op == CB_CONST) emit_load_const(f, a->value, REG_RAX);
+        else if (a->op == CB_LEN) fprintf(f, "  movq %%r15, %%rax\n");
+        else emit_load_local(s, a->index, REG_RAX);
+    } else if (!b->has_call && scratch_depth < s->num_scratch) {
+        int sreg = s->scratch_regs[scratch_depth];
+        emit_expr(s, a, scratch_depth, spill_depth);
+        fprintf(f, "  movq %%rax, %s\n", reg64_name[sreg]);
+        emit_expr(s, b, scratch_depth + 1, spill_depth);
+        fprintf(f, "  movq %%rax, %%rcx\n  movq %s, %%rax\n", reg64_name[sreg]);
+    } else if (spill_depth < s->num_call_safe) {
+        int creg = s->call_safe_regs[spill_depth];
+        emit_expr(s, a, scratch_depth, spill_depth);
+        fprintf(f, "  movq %%rax, %s\n", reg64_name[creg]);
+        emit_expr(s, b, scratch_depth, spill_depth + 1);
+        fprintf(f, "  movq %%rax, %%rcx\n  movq %s, %%rax\n", reg64_name[creg]);
+    } else {
+        int sp_idx = s->base_stack_slots + (spill_depth - s->num_call_safe);
+        int off = stack_offset_for_slot(s, sp_idx);
+        emit_expr(s, a, scratch_depth, spill_depth);
+        fprintf(f, "  movq %%rax, %d(%%rbp)\n", off);
+        emit_expr(s, b, scratch_depth, spill_depth + 1);
+        fprintf(f, "  movq %%rax, %%rcx\n  movq %d(%%rbp), %%rax\n", off);
+    }
+
+    switch (e->op) {
+    case CB_ADD: case CB_SUB: case CB_MUL: case CB_AND: case CB_OR: case CB_XOR:
+    case CB_EQ: case CB_NE: case CB_LT: case CB_LE: case CB_GT: case CB_GE:
+        emit_binop_rhs_op(s, e->op, "%rcx");
+        break;
+    case CB_SHL: fprintf(f, "  shlq %%cl, %%rax\n"); break;
+    case CB_SHR: fprintf(f, "  shrq %%cl, %%rax\n"); break;
+    case CB_DIV: case CB_MOD: {
+        unsigned lbl = s->label++;
+        fprintf(f, "  testq %%rcx, %%rcx\n  jz .L%u\n  xorl %%edx, %%edx\n  divq %%rcx\n", lbl);
+        if (e->op == CB_MOD) fprintf(f, "  movq %%rdx, %%rax\n");
+        fprintf(f, "  jmp .L%u_d\n.L%u:\n  xorl %%eax, %%eax\n.L%u_d:\n", lbl, lbl, lbl);
+        break;
+    }
+    default: break;
+    }
+}
+
+static void emit_epilogue(FnEmit *s) {
+    FILE *f = s->out;
+    if (!s->has_frame) return;
+    if (s->frame_sub_bytes > 0) fprintf(f, "  addq $%d, %%rsp\n", s->frame_sub_bytes);
+    if (s->used_callee[2]) fprintf(f, "  popq %%r13\n");
+    if (s->used_callee[1]) fprintf(f, "  popq %%r12\n");
+    if (s->used_callee[0]) fprintf(f, "  popq %%rbx\n");
+    fprintf(f, "  popq %%rbp\n");
+}
+
+static void emit_tail(FnEmit *s, const IrExpr *e) {
+    FILE *f = s->out;
+    if (e->op == CB_IF) {
+        unsigned else_lbl = s->label++;
+        int vt = -1, vf = -1;
+        check_if_bounds_var(e->arg[0], &vt, &vf);
+        emit_branch_if(s, e->arg[0], 0, else_lbl, 0, 0);
+        uint8_t old_vt = (vt >= 0) ? s->in_bounds_var[vt] : 0;
+        if (vt >= 0) s->in_bounds_var[vt] = 1;
+        emit_tail(s, e->arg[1]);
+        if (vt >= 0) s->in_bounds_var[vt] = old_vt;
+        fprintf(f, ".L%u:\n", else_lbl);
+        uint8_t old_vf = (vf >= 0) ? s->in_bounds_var[vf] : 0;
+        if (vf >= 0) s->in_bounds_var[vf] = 1;
+        emit_tail(s, e->arg[2]);
+        if (vf >= 0) s->in_bounds_var[vf] = old_vf;
+        return;
+    }
+    if (e->op == CB_LET) {
+        emit_expr(s, e->arg[0], 0, 0);
+        emit_store_local(s, REG_RAX, e->index);
+        emit_tail(s, e->arg[1]);
+        return;
+    }
+    if (e->op == CB_CALL) {
+        if (e->index == s->fn_idx) {
+            emit_call_args(s, e, s->local_reg, s->local_stack_slot, 0, 0);
+            fprintf(f, "  jmp .Lloop_fn%d\n", s->fn_idx);
+        } else if (!s->right_spine_loop) {
+            emit_call_args(s, e, param_regs, NULL, 0, 0);
+            emit_epilogue(s);
+            fprintf(f, "  jmp .Lfn%d\n", e->index);
+        } else {
+            emit_expr(s, e, 0, 0);
+            fprintf(f, "  %s %s, %%rax\n",
+                    s->right_spine_op == CB_ADD ? "addq" :
+                    s->right_spine_op == CB_XOR ? "xorq" :
+                    s->right_spine_op == CB_OR  ? "orq"  :
+                    s->right_spine_op == CB_AND ? "andq" : "imulq",
+                    reg64_name[s->right_spine_reg]);
+            emit_epilogue(s);
+            fprintf(f, "  ret\n");
+        }
+        return;
+    }
+    if (s->right_spine_loop && e->op == s->right_spine_op) {
+        const IrExpr *lhs = e->arg[0], *rhs = e->arg[1];
+        const IrExpr *rcall = NULL, *other = NULL;
+        if (rhs->op == CB_CALL && rhs->index == s->fn_idx) { rcall = rhs; other = lhs; }
+        else if (lhs->op == CB_CALL && lhs->index == s->fn_idx) { rcall = lhs; other = rhs; }
+        if (rcall) {
+            emit_expr(s, other, 0, 0);
+            fprintf(f, "  %s %%rax, %s\n",
+                    s->right_spine_op == CB_ADD ? "addq" :
+                    s->right_spine_op == CB_XOR ? "xorq" :
+                    s->right_spine_op == CB_OR  ? "orq"  :
+                    s->right_spine_op == CB_AND ? "andq" : "imulq",
+                    reg64_name[s->right_spine_reg]);
+            emit_call_args(s, rcall, s->local_reg, s->local_stack_slot, 0, 0);
+            fprintf(f, "  jmp .Lloop_fn%d\n", s->fn_idx);
+            return;
+        }
+    }
+    emit_expr(s, e, 0, 0);
+    if (s->right_spine_loop) {
+        fprintf(f, "  %s %s, %%rax\n",
+                s->right_spine_op == CB_ADD ? "addq" :
+                s->right_spine_op == CB_XOR ? "xorq" :
+                s->right_spine_op == CB_OR  ? "orq"  :
+                s->right_spine_op == CB_AND ? "andq" : "imulq",
+                reg64_name[s->right_spine_reg]);
+    }
+    emit_epilogue(s);
+    fprintf(f, "  ret\n");
+}
+
+typedef struct {
+    int idx_param;
+    CbOp cmp_op;
+    IrExpr *limit_expr;
+    IrExpr *let_vals[MAX_IR_LOCALS];
+    int let_order[MAX_IR_LOCALS];
+    int num_lets;
+    IrExpr *next_args[CB_MAX_PARAMS];
+    AccInfo acc[CB_MAX_PARAMS];
+    int has_get;
+    uint64_t max_get_offset;
+    int uses_idx_vec;
+    int let_ymm[MAX_IR_LOCALS];
+} VecLoopPlan;
+
+static int is_loop_invariant_expr(const IrExpr *e, int arity, const uint8_t *inv_param) {
+    if (!e || e->has_call) return 0;
+    if (e->op == CB_CONST || e->op == CB_LEN) return 1;
+    if (e->op == CB_VAR) return (e->index >= 0 && e->index < arity && inv_param[e->index]);
+    if (e->op == CB_GET || e->op == CB_LET || e->op == CB_IF) return 0;
+    if (e->op >= CB_ADD)
+        return is_loop_invariant_expr(e->arg[0], arity, inv_param) &&
+               is_loop_invariant_expr(e->arg[1], arity, inv_param);
+    return 0;
+}
+
+static int expr_refs_any_acc(const IrExpr *e, int arity, int idx_param, const uint8_t *inv_param, IrExpr *const *let_vals) {
+    if (!e) return 0;
+    if (e->op == CB_VAR) {
+        int v = e->index;
+        if (v < arity) return (v != idx_param && !inv_param[v]);
+        if (let_vals[v]) return expr_refs_any_acc(let_vals[v], arity, idx_param, inv_param, let_vals);
+        return 1;
+    }
+    int nchild = (e->op == CB_GET) ? 1 : (e->op == CB_IF ? 3 : (e->op == CB_LET ? 2 : (e->op >= CB_ADD ? 2 : 0)));
+    for (int i = 0; i < nchild; ++i)
+        if (expr_refs_any_acc(e->arg[i], arity, idx_param, inv_param, let_vals)) return 1;
+    return 0;
+}
+
+static const IrExpr *resolve_let_var(const IrExpr *e, IrExpr *const *let_vals) {
+    while (e && e->op == CB_VAR && e->index >= 0 && e->index < MAX_IR_LOCALS && let_vals[e->index]) {
+        e = let_vals[e->index];
+    }
+    return e;
+}
+
+static int match_acc_update(IrProgram *p, int param_idx, const IrExpr *raw_e, int arity, int idx_param,
+                            const uint8_t *inv_param, IrExpr *const *let_vals, AccInfo *out) {
+    const IrExpr *e = resolve_let_var(raw_e, let_vals);
+    if (!e) return 0;
+    if (e->op == CB_VAR && e->index == param_idx) {
+        out->kind = RED_INVARIANT;
+        return 1;
+    }
+    if (e->op == CB_ADD || e->op == CB_SUB || e->op == CB_XOR || e->op == CB_OR || e->op == CB_AND || e->op == CB_MUL) {
+        const IrExpr *a = resolve_let_var(e->arg[0], let_vals);
+        const IrExpr *b = resolve_let_var(e->arg[1], let_vals);
+        const IrExpr *rhs = NULL;
+        if (a->op == CB_VAR && a->index == param_idx) rhs = e->arg[1];
+        else if (e->op != CB_SUB && b->op == CB_VAR && b->index == param_idx) rhs = e->arg[0];
+        if (rhs && !expr_refs_any_acc(rhs, arity, idx_param, inv_param, let_vals)) {
+            out->kind = (e->op == CB_ADD) ? RED_ADD :
+                        (e->op == CB_SUB) ? RED_SUB :
+                        (e->op == CB_XOR) ? RED_XOR :
+                        (e->op == CB_OR)  ? RED_OR  :
+                        (e->op == CB_AND) ? RED_AND : RED_MUL;
+            out->rhs = (IrExpr *)rhs;
+            return 1;
+        }
+        if ((e->op == CB_ADD || e->op == CB_SUB) && a->op == CB_MUL) {
+            const IrExpr *ma = resolve_let_var(a->arg[0], let_vals);
+            const IrExpr *mb = resolve_let_var(a->arg[1], let_vals);
+            if (ma->op == CB_VAR && ma->index == param_idx && mb->op == CB_CONST &&
+                !expr_refs_any_acc(e->arg[1], arity, idx_param, inv_param, let_vals)) {
+                out->kind = RED_AFFINE;
+                out->affine_c = mb->value;
+                if (e->op == CB_ADD) {
+                    out->rhs = e->arg[1];
+                } else {
+                    IrExpr *neg = alloc_node(p, CB_SUB);
+                    if (!neg) return 0;
+                    neg->arg[0] = alloc_const(p, 0);
+                    neg->arg[1] = e->arg[1];
+                    out->rhs = neg;
+                }
+                return 1;
+            }
+        }
+        if (e->op == CB_ADD && b->op == CB_MUL) {
+            const IrExpr *ma = resolve_let_var(b->arg[0], let_vals);
+            const IrExpr *mb = resolve_let_var(b->arg[1], let_vals);
+            if (ma->op == CB_VAR && ma->index == param_idx && mb->op == CB_CONST &&
+                !expr_refs_any_acc(e->arg[0], arity, idx_param, inv_param, let_vals)) {
+                out->kind = RED_AFFINE;
+                out->affine_c = mb->value;
+                out->rhs = e->arg[0];
+                return 1;
+            }
+        }
+    }
+    if (e->op == CB_IF && !expr_refs_any_acc(e->arg[0], arity, idx_param, inv_param, let_vals)) {
+        const IrExpr *t = resolve_let_var(e->arg[1], let_vals);
+        const IrExpr *f = resolve_let_var(e->arg[2], let_vals);
+        AccInfo at, af;
+        memset(&at, 0, sizeof(at));
+        memset(&af, 0, sizeof(af));
+        if (t->op == CB_VAR && t->index == param_idx &&
+            match_acc_update(p, param_idx, f, arity, idx_param, inv_param, let_vals, &af) &&
+            (af.kind == RED_ADD || af.kind == RED_SUB || af.kind == RED_XOR || af.kind == RED_OR || af.kind == RED_AND || af.kind == RED_MUL)) {
+            uint64_t id = (af.kind == RED_MUL) ? 1ULL : (af.kind == RED_AND ? ~0ULL : 0ULL);
+            IrExpr *ifn = alloc_node(p, CB_IF);
+            if (!ifn) return 0;
+            ifn->arg[0] = e->arg[0];
+            ifn->arg[1] = alloc_const(p, id);
+            ifn->arg[2] = af.rhs;
+            out->kind = af.kind;
+            out->rhs = ifn;
+            return 1;
+        }
+        if (f->op == CB_VAR && f->index == param_idx &&
+            match_acc_update(p, param_idx, t, arity, idx_param, inv_param, let_vals, &at) &&
+            (at.kind == RED_ADD || at.kind == RED_SUB || at.kind == RED_XOR || at.kind == RED_OR || at.kind == RED_AND || at.kind == RED_MUL)) {
+            uint64_t id = (at.kind == RED_MUL) ? 1ULL : (at.kind == RED_AND ? ~0ULL : 0ULL);
+            IrExpr *ifn = alloc_node(p, CB_IF);
+            if (!ifn) return 0;
+            ifn->arg[0] = e->arg[0];
+            ifn->arg[1] = at.rhs;
+            ifn->arg[2] = alloc_const(p, id);
+            out->kind = at.kind;
+            out->rhs = ifn;
+            return 1;
+        }
+        if (match_acc_update(p, param_idx, t, arity, idx_param, inv_param, let_vals, &at) &&
+            match_acc_update(p, param_idx, f, arity, idx_param, inv_param, let_vals, &af) &&
+            at.kind == af.kind &&
+            (at.kind == RED_ADD || at.kind == RED_SUB || at.kind == RED_XOR || at.kind == RED_OR || at.kind == RED_AND || at.kind == RED_MUL)) {
+            IrExpr *ifn = alloc_node(p, CB_IF);
+            if (!ifn) return 0;
+            ifn->arg[0] = e->arg[0];
+            ifn->arg[1] = at.rhs;
+            ifn->arg[2] = af.rhs;
+            out->kind = at.kind;
+            out->rhs = ifn;
+            return 1;
+        }
+    }
+    if (e->op == CB_IF) {
+        const IrExpr *c = resolve_let_var(e->arg[0], let_vals);
+        const IrExpr *t = resolve_let_var(e->arg[1], let_vals);
+        const IrExpr *f = resolve_let_var(e->arg[2], let_vals);
+        if (c->op >= CB_LT && c->op <= CB_GE) {
+            const IrExpr *ca = resolve_let_var(c->arg[0], let_vals);
+            const IrExpr *cb = resolve_let_var(c->arg[1], let_vals);
+            if (f->op == CB_VAR && f->index == param_idx && !expr_refs_any_acc(t, arity, idx_param, inv_param, let_vals)) {
+                if ((c->op == CB_GT || c->op == CB_GE) && expr_eq(ca, t) && cb->op == CB_VAR && cb->index == param_idx) {
+                    out->kind = RED_MAX; out->rhs = e->arg[1]; return 1;
+                }
+                if ((c->op == CB_LT || c->op == CB_LE) && expr_eq(cb, t) && ca->op == CB_VAR && ca->index == param_idx) {
+                    out->kind = RED_MAX; out->rhs = e->arg[1]; return 1;
+                }
+                if ((c->op == CB_LT || c->op == CB_LE) && expr_eq(ca, t) && cb->op == CB_VAR && cb->index == param_idx) {
+                    out->kind = RED_MIN; out->rhs = e->arg[1]; return 1;
+                }
+                if ((c->op == CB_GT || c->op == CB_GE) && expr_eq(cb, t) && ca->op == CB_VAR && ca->index == param_idx) {
+                    out->kind = RED_MIN; out->rhs = e->arg[1]; return 1;
+                }
+            }
+            if (t->op == CB_VAR && t->index == param_idx && !expr_refs_any_acc(f, arity, idx_param, inv_param, let_vals)) {
+                if ((c->op == CB_LT || c->op == CB_LE) && expr_eq(ca, f) && cb->op == CB_VAR && cb->index == param_idx) {
+                    out->kind = RED_MAX; out->rhs = e->arg[2]; return 1;
+                }
+                if ((c->op == CB_GT || c->op == CB_GE) && expr_eq(cb, f) && ca->op == CB_VAR && ca->index == param_idx) {
+                    out->kind = RED_MAX; out->rhs = e->arg[2]; return 1;
+                }
+                if ((c->op == CB_GT || c->op == CB_GE) && expr_eq(ca, f) && cb->op == CB_VAR && cb->index == param_idx) {
+                    out->kind = RED_MIN; out->rhs = e->arg[2]; return 1;
+                }
+                if ((c->op == CB_LT || c->op == CB_LE) && expr_eq(cb, f) && ca->op == CB_VAR && ca->index == param_idx) {
+                    out->kind = RED_MIN; out->rhs = e->arg[2]; return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int can_vec_expr(const IrExpr *e, VecLoopPlan *plan, int arity, const uint8_t *inv_param, int depth) {
+    if (!e || e->has_call || depth > 7) return 0;
+    switch (e->op) {
+    case CB_CONST: case CB_LEN: return 1;
+    case CB_VAR: {
+        int v = e->index;
+        if (v == plan->idx_param) { plan->uses_idx_vec = 1; return 1; }
+        if (v < arity) return inv_param[v] != 0;
+        if (plan->let_ymm[v] >= 0) return 1;
+        if (plan->let_vals[v]) return can_vec_expr(plan->let_vals[v], plan, arity, inv_param, depth);
+        return 0;
+    }
+    case CB_GET: {
+        uint64_t off = 0;
+        const IrExpr *idx = resolve_let_var(e->arg[0], plan->let_vals);
+        if (idx->op == CB_VAR && idx->index == plan->idx_param) {
+            off = 0;
+        } else if (idx->op == CB_ADD && idx->arg[0]->op == CB_VAR && idx->arg[0]->index == plan->idx_param &&
+                   idx->arg[1]->op == CB_CONST && idx->arg[1]->value <= 16) {
+            off = idx->arg[1]->value;
+        } else {
+            return 0;
+        }
+        plan->has_get = 1;
+        if (off > plan->max_get_offset) plan->max_get_offset = off;
+        return 1;
+    }
+    case CB_IF:
+        return can_vec_expr(e->arg[0], plan, arity, inv_param, depth) &&
+               can_vec_expr(e->arg[1], plan, arity, inv_param, depth + 1) &&
+               can_vec_expr(e->arg[2], plan, arity, inv_param, depth + 2);
+    case CB_LET:
+        return 0;
+    case CB_DIV: case CB_MOD:
+        return e->arg[1]->op == CB_CONST && can_vec_expr(e->arg[0], plan, arity, inv_param, depth);
+    default:
+        return can_vec_expr(e->arg[0], plan, arity, inv_param, depth) &&
+               can_vec_expr(e->arg[1], plan, arity, inv_param, depth + 1);
+    }
+}
+
+static void emit_vec_bcast_const(FILE *f, uint64_t v, int ymm) {
+    if (v == 0) {
+        fprintf(f, "  vpxor %%ymm%d, %%ymm%d, %%ymm%d\n", ymm, ymm, ymm);
+    } else if (v == ~0ULL) {
+        fprintf(f, "  vpcmpeqq %%ymm%d, %%ymm%d, %%ymm%d\n", ymm, ymm, ymm);
+    } else {
+        emit_load_const(f, v, REG_RAX);
+        fprintf(f, "  vmovq %%rax, %%xmm%d\n  vpbroadcastq %%xmm%d, %%ymm%d\n", ymm, ymm, ymm);
+    }
+}
+
+static void emit_vec_mul64(FILE *f, int ymm_a, int ymm_b, int ymm_tmp1, int ymm_tmp2) {
+    fprintf(f, "  vpsrlq $32, %%ymm%d, %%ymm%d\n"
+               "  vpsrlq $32, %%ymm%d, %%ymm%d\n"
+               "  vpmuludq %%ymm%d, %%ymm%d, %%ymm%d\n"
+               "  vpmuludq %%ymm%d, %%ymm%d, %%ymm%d\n"
+               "  vpaddq %%ymm%d, %%ymm%d, %%ymm%d\n"
+               "  vpsllq $32, %%ymm%d, %%ymm%d\n"
+               "  vpmuludq %%ymm%d, %%ymm%d, %%ymm%d\n"
+               "  vpaddq %%ymm%d, %%ymm%d, %%ymm%d\n",
+            ymm_a, ymm_tmp1,
+            ymm_b, ymm_tmp2,
+            ymm_tmp2, ymm_a, ymm_tmp2,
+            ymm_b, ymm_tmp1, ymm_tmp1,
+            ymm_tmp1, ymm_tmp2, ymm_tmp2,
+            ymm_tmp2, ymm_tmp2,
+            ymm_b, ymm_a, ymm_a,
+            ymm_tmp2, ymm_a, ymm_a);
+}
+
+static void emit_vec_div_mod_const(FILE *f, uint64_t d, int is_mod, int ymm_x, int ymm_t0, int ymm_t1, int ymm_t2) {
+    if (d == 0) {
+        fprintf(f, "  vpxor %%ymm%d, %%ymm%d, %%ymm%d\n", ymm_x, ymm_x, ymm_x);
+        return;
+    }
+    int sh = 0;
+    if (is_pow2_u64(d, &sh)) {
+        if (is_mod) {
+            if (d == 1) fprintf(f, "  vpxor %%ymm%d, %%ymm%d, %%ymm%d\n", ymm_x, ymm_x, ymm_x);
+            else {
+                emit_vec_bcast_const(f, d - 1, ymm_t0);
+                fprintf(f, "  vpand %%ymm%d, %%ymm%d, %%ymm%d\n", ymm_t0, ymm_x, ymm_x);
+            }
+        } else {
+            if (sh > 0) fprintf(f, "  vpsrlq $%d, %%ymm%d, %%ymm%d\n", sh, ymm_x, ymm_x);
+        }
+        return;
+    }
+    uint64_t m = 0;
+    int l = 0;
+    compute_magic_div_u64(d, &m, &l);
+    uint64_t m_lo = m & 0xFFFFFFFFULL;
+    uint64_t m_hi = m >> 32;
+
+    emit_vec_bcast_const(f, 0xFFFFFFFFULL, ymm_t2);
+    fprintf(f, "  vpsrlq $32, %%ymm%d, %%ymm%d\n", ymm_x, ymm_t0);
+    emit_vec_bcast_const(f, m_lo, ymm_t1);
+    fprintf(f, "  vpmuludq %%ymm%d, %%ymm%d, %%ymm%d\n", ymm_t1, ymm_x, ymm_t2);
+    fprintf(f, "  vpsrlq $32, %%ymm%d, %%ymm%d\n", ymm_t2, ymm_t2);
+    fprintf(f, "  vpmuludq %%ymm%d, %%ymm%d, %%ymm%d\n", ymm_t1, ymm_t0, ymm_t1);
+
+    emit_vec_bcast_const(f, 0xFFFFFFFFULL, 10);
+    fprintf(f, "  vpand %%ymm10, %%ymm%d, %%ymm10\n", ymm_t1);
+    fprintf(f, "  vpaddq %%ymm10, %%ymm%d, %%ymm%d\n", ymm_t2, ymm_t2);
+    fprintf(f, "  vpsrlq $32, %%ymm%d, %%ymm%d\n", ymm_t1, ymm_t1);
+
+    emit_vec_bcast_const(f, m_hi, 10);
+    fprintf(f, "  vpmuludq %%ymm10, %%ymm%d, %%ymm11\n", ymm_x);
+    fprintf(f, "  vpmuludq %%ymm10, %%ymm%d, %%ymm10\n", ymm_t0);
+    fprintf(f, "  vpaddq %%ymm10, %%ymm%d, %%ymm%d\n", ymm_t1, ymm_t1);
+
+    emit_vec_bcast_const(f, 0xFFFFFFFFULL, 10);
+    fprintf(f, "  vpand %%ymm10, %%ymm11, %%ymm10\n");
+    fprintf(f, "  vpaddq %%ymm10, %%ymm%d, %%ymm%d\n", ymm_t2, ymm_t2);
+    fprintf(f, "  vpsrlq $32, %%ymm11, %%ymm11\n");
+    fprintf(f, "  vpaddq %%ymm11, %%ymm%d, %%ymm%d\n", ymm_t1, ymm_t1);
+    fprintf(f, "  vpsrlq $32, %%ymm%d, %%ymm%d\n", ymm_t2, ymm_t2);
+    fprintf(f, "  vpaddq %%ymm%d, %%ymm%d, %%ymm%d\n", ymm_t2, ymm_t1, ymm_t1);
+
+    fprintf(f, "  vpsubq %%ymm%d, %%ymm%d, %%ymm%d\n"
+               "  vpsrlq $1, %%ymm%d, %%ymm%d\n"
+               "  vpaddq %%ymm%d, %%ymm%d, %%ymm%d\n",
+            ymm_t1, ymm_x, ymm_t0,
+            ymm_t0, ymm_t0,
+            ymm_t1, ymm_t0, ymm_t0);
+    if (l > 1) fprintf(f, "  vpsrlq $%d, %%ymm%d, %%ymm%d\n", l - 1, ymm_t0, ymm_t0);
+
+    if (!is_mod) {
+        fprintf(f, "  vmovdqa %%ymm%d, %%ymm%d\n", ymm_t0, ymm_x);
+    } else {
+        emit_vec_bcast_const(f, d, ymm_t1);
+        emit_vec_mul64(f, ymm_t0, ymm_t1, 10, 11);
+        fprintf(f, "  vpsubq %%ymm%d, %%ymm%d, %%ymm%d\n", ymm_t0, ymm_x, ymm_x);
+    }
+}
+
+static void emit_vec_expr(const FnEmit *s, const VecLoopPlan *plan, const IrExpr *e, int dst_ymm, int unroll_off) {
+    FILE *f = s->out;
+    switch (e->op) {
+    case CB_CONST:
+        emit_vec_bcast_const(f, e->value, dst_ymm);
+        return;
+    case CB_LEN:
+        fprintf(f, "  vmovq %%r15, %%xmm%d\n  vpbroadcastq %%xmm%d, %%ymm%d\n", dst_ymm, dst_ymm, dst_ymm);
+        return;
+    case CB_VAR: {
+        int v = e->index;
+        if (v == plan->idx_param) {
+            if (unroll_off == 0) {
+                fprintf(f, "  vmovdqa %%ymm15, %%ymm%d\n", dst_ymm);
+            } else {
+                emit_vec_bcast_const(f, (uint64_t)unroll_off, dst_ymm);
+                fprintf(f, "  vpaddq %%ymm15, %%ymm%d, %%ymm%d\n", dst_ymm, dst_ymm);
+            }
+            return;
+        }
+        if (v < s->fn->arity) {
+            int r = s->local_reg[v];
+            fprintf(f, "  vmovq %s, %%xmm%d\n  vpbroadcastq %%xmm%d, %%ymm%d\n", reg64_name[r], dst_ymm, dst_ymm, dst_ymm);
+            return;
+        }
+        if (plan->let_ymm[v] >= 0 && unroll_off == 0) {
+            fprintf(f, "  vmovdqa %%ymm%d, %%ymm%d\n", plan->let_ymm[v], dst_ymm);
+            return;
+        }
+        emit_vec_expr(s, plan, plan->let_vals[v], dst_ymm, unroll_off);
+        return;
+    }
+    case CB_GET: {
+        uint64_t off = 0;
+        const IrExpr *idx = resolve_let_var(e->arg[0], plan->let_vals);
+        if (idx->op == CB_ADD) off = idx->arg[1]->value;
+        off += (uint64_t)unroll_off;
+        int ri = s->local_reg[plan->idx_param];
+        if (off == 0) fprintf(f, "  vmovdqu (%%r14,%s,8), %%ymm%d\n", reg64_name[ri], dst_ymm);
+        else fprintf(f, "  vmovdqu %" PRIu64 "(%%r14,%s,8), %%ymm%d\n", off * 8, reg64_name[ri], dst_ymm);
+        return;
+    }
+    case CB_IF: {
+        int yt = dst_ymm + 1;
+        int ye = dst_ymm + 2;
+        emit_vec_expr(s, plan, e->arg[0], dst_ymm, unroll_off);
+        emit_vec_expr(s, plan, e->arg[1], yt, unroll_off);
+        emit_vec_expr(s, plan, e->arg[2], ye, unroll_off);
+        fprintf(f, "  vpxor %%ymm10, %%ymm10, %%ymm10\n"
+                   "  vpcmpeqq %%ymm10, %%ymm%d, %%ymm%d\n"
+                   "  vpxor %%ymm%d, %%ymm%d, %%ymm10\n"
+                   "  vpand %%ymm%d, %%ymm10, %%ymm10\n"
+                   "  vpxor %%ymm%d, %%ymm10, %%ymm%d\n",
+                dst_ymm, dst_ymm,
+                ye, yt,
+                dst_ymm,
+                yt, dst_ymm);
+        return;
+    }
+    case CB_DIV: case CB_MOD:
+        emit_vec_expr(s, plan, e->arg[0], dst_ymm, unroll_off);
+        emit_vec_div_mod_const(f, e->arg[1]->value, e->op == CB_MOD, dst_ymm, dst_ymm + 1, dst_ymm + 2, dst_ymm + 3);
+        return;
+    default: break;
+    }
+
+    if ((e->op == CB_SHL || e->op == CB_SHR) && e->arg[1]->op == CB_CONST) {
+        emit_vec_expr(s, plan, e->arg[0], dst_ymm, unroll_off);
+        unsigned sh = (unsigned)(e->arg[1]->value & 63);
+        if (sh > 0) fprintf(f, "  %s $%u, %%ymm%d, %%ymm%d\n", e->op == CB_SHL ? "vpsllq" : "vpsrlq", sh, dst_ymm, dst_ymm);
+        return;
+    }
+
+    int yr = dst_ymm + 1;
+    emit_vec_expr(s, plan, e->arg[0], dst_ymm, unroll_off);
+    emit_vec_expr(s, plan, e->arg[1], yr, unroll_off);
+
+    switch (e->op) {
+    case CB_ADD: fprintf(f, "  vpaddq %%ymm%d, %%ymm%d, %%ymm%d\n", yr, dst_ymm, dst_ymm); break;
+    case CB_SUB: fprintf(f, "  vpsubq %%ymm%d, %%ymm%d, %%ymm%d\n", yr, dst_ymm, dst_ymm); break;
+    case CB_AND: fprintf(f, "  vpand %%ymm%d, %%ymm%d, %%ymm%d\n", yr, dst_ymm, dst_ymm); break;
+    case CB_OR:  fprintf(f, "  vpor %%ymm%d, %%ymm%d, %%ymm%d\n", yr, dst_ymm, dst_ymm); break;
+    case CB_XOR: fprintf(f, "  vpxor %%ymm%d, %%ymm%d, %%ymm%d\n", yr, dst_ymm, dst_ymm); break;
+    case CB_SHL:
+        emit_vec_bcast_const(f, 63, 10);
+        fprintf(f, "  vpand %%ymm10, %%ymm%d, %%ymm%d\n  vpsllvq %%ymm%d, %%ymm%d, %%ymm%d\n",
+                yr, yr, yr, dst_ymm, dst_ymm);
+        break;
+    case CB_SHR:
+        emit_vec_bcast_const(f, 63, 10);
+        fprintf(f, "  vpand %%ymm10, %%ymm%d, %%ymm%d\n  vpsrlvq %%ymm%d, %%ymm%d, %%ymm%d\n",
+                yr, yr, yr, dst_ymm, dst_ymm);
+        break;
+    case CB_MUL:
+        emit_vec_mul64(f, dst_ymm, yr, 10, 11);
+        break;
+    case CB_EQ:
+        fprintf(f, "  vpcmpeqq %%ymm%d, %%ymm%d, %%ymm%d\n  vpsrlq $63, %%ymm%d, %%ymm%d\n",
+                yr, dst_ymm, dst_ymm, dst_ymm, dst_ymm);
+        break;
+    case CB_NE:
+        fprintf(f, "  vpcmpeqq %%ymm%d, %%ymm%d, %%ymm%d\n  vpcmpeqq %%ymm10, %%ymm10, %%ymm10\n"
+                   "  vpxor %%ymm10, %%ymm%d, %%ymm%d\n  vpsrlq $63, %%ymm%d, %%ymm%d\n",
+                yr, dst_ymm, dst_ymm, dst_ymm, dst_ymm, dst_ymm, dst_ymm);
+        break;
+    case CB_GT: case CB_LT: case CB_GE: case CB_LE: {
+        emit_vec_bcast_const(f, 0x8000000000000000ULL, 10);
+        fprintf(f, "  vpxor %%ymm10, %%ymm%d, %%ymm%d\n  vpxor %%ymm10, %%ymm%d, %%ymm%d\n",
+                dst_ymm, dst_ymm, yr, yr);
+        if (e->op == CB_GT || e->op == CB_LE)
+            fprintf(f, "  vpcmpgtq %%ymm%d, %%ymm%d, %%ymm%d\n", yr, dst_ymm, dst_ymm);
+        else
+            fprintf(f, "  vpcmpgtq %%ymm%d, %%ymm%d, %%ymm%d\n", dst_ymm, yr, dst_ymm);
+        if (e->op == CB_LE || e->op == CB_GE) {
+            fprintf(f, "  vpcmpeqq %%ymm10, %%ymm10, %%ymm10\n  vpxor %%ymm10, %%ymm%d, %%ymm%d\n",
+                    dst_ymm, dst_ymm);
+        }
+        fprintf(f, "  vpsrlq $63, %%ymm%d, %%ymm%d\n", dst_ymm, dst_ymm);
+        break;
+    }
+    default: break;
+    }
+}
+
+static void emit_vec_acc_update(FILE *f, const AccInfo *ai, int acc_ymm, int rhs_ymm) {
+    switch (ai->kind) {
+    case RED_ADD: case RED_SUB:
+        fprintf(f, "  vpaddq %%ymm%d, %%ymm%d, %%ymm%d\n", rhs_ymm, acc_ymm, acc_ymm);
+        break;
+    case RED_XOR:
+        fprintf(f, "  vpxor %%ymm%d, %%ymm%d, %%ymm%d\n", rhs_ymm, acc_ymm, acc_ymm);
+        break;
+    case RED_OR:
+        fprintf(f, "  vpor %%ymm%d, %%ymm%d, %%ymm%d\n", rhs_ymm, acc_ymm, acc_ymm);
+        break;
+    case RED_AND:
+        fprintf(f, "  vpand %%ymm%d, %%ymm%d, %%ymm%d\n", rhs_ymm, acc_ymm, acc_ymm);
+        break;
+    case RED_MUL:
+        emit_vec_mul64(f, acc_ymm, rhs_ymm, 10, 11);
+        break;
+    case RED_MAX: case RED_MIN:
+        emit_vec_bcast_const(f, 0x8000000000000000ULL, 10);
+        fprintf(f, "  vpxor %%ymm10, %%ymm%d, %%ymm%d\n", rhs_ymm, rhs_ymm);
+        if (ai->kind == RED_MAX)
+            fprintf(f, "  vpcmpgtq %%ymm%d, %%ymm%d, %%ymm10\n", acc_ymm, rhs_ymm);
+        else
+            fprintf(f, "  vpcmpgtq %%ymm%d, %%ymm%d, %%ymm10\n", rhs_ymm, acc_ymm);
+        fprintf(f, "  vpxor %%ymm%d, %%ymm%d, %%ymm%d\n"
+                   "  vpand %%ymm10, %%ymm%d, %%ymm%d\n"
+                   "  vpxor %%ymm%d, %%ymm%d, %%ymm%d\n",
+                acc_ymm, rhs_ymm, rhs_ymm,
+                rhs_ymm, rhs_ymm,
+                rhs_ymm, acc_ymm, acc_ymm);
+        break;
+    case RED_AFFINE: {
+        uint64_t c = ai->affine_c;
+        uint64_t c4 = c * c * c * c;
+        emit_vec_bcast_const(f, c4, 9);
+        emit_vec_mul64(f, acc_ymm, 9, 10, 11);
+        fprintf(f, "  vpaddq %%ymm%d, %%ymm%d, %%ymm%d\n", rhs_ymm, acc_ymm, acc_ymm);
+        break;
+    }
+    default: break;
+    }
+}
+
+static int parse_simple_loop(IrProgram *p, int fn_idx, VecLoopPlan *plan, IrExpr **loop_br_out) {
+    IrFunction *fn = &p->fn[fn_idx];
+    int self_calls = 0;
+    if (!is_self_tail_only(fn->body, fn_idx, 1, &self_calls) || self_calls != 1) return 0;
+    if (fn->arity < 1 || fn->arity > 4 || fn->body->op != CB_IF) return 0;
+
+    IrExpr *cond = fn->body->arg[0];
+    IrExpr *t = fn->body->arg[1];
+    IrExpr *f = fn->body->arg[2];
+    int inv = 0;
+    IrExpr *loop_br = NULL;
+    if (t->has_call && !f->has_call) { loop_br = t; inv = 0; }
+    else if (!t->has_call && f->has_call) { loop_br = f; inv = 1; }
+    else return 0;
+
+    if (cond->op < CB_EQ || cond->op > CB_GE) return 0;
+    CbOp cop = cond->op;
+    if (inv) {
+        static const CbOp inv_map[] = { CB_NE, CB_EQ, CB_GE, CB_GT, CB_LE, CB_LT };
+        cop = inv_map[cop - CB_EQ];
+    }
+    IrExpr *lhs = cond->arg[0], *rhs = cond->arg[1];
+    if (rhs->op == CB_VAR && rhs->index < fn->arity && !(lhs->op == CB_VAR && lhs->index < fn->arity)) {
+        IrExpr *tmp = lhs; lhs = rhs; rhs = tmp;
+        if (cop == CB_LT) cop = CB_GT;
+        else if (cop == CB_LE) cop = CB_GE;
+        else if (cop == CB_GT) cop = CB_LT;
+        else if (cop == CB_GE) cop = CB_LE;
+    }
+    if (lhs->op != CB_VAR || lhs->index >= fn->arity) return 0;
+    if (cop != CB_LT && cop != CB_NE && cop != CB_LE) return 0;
+
+    memset(plan, 0, sizeof(*plan));
+    for (int i = 0; i < MAX_IR_LOCALS; ++i) plan->let_ymm[i] = -1;
+    plan->idx_param = lhs->index;
+    plan->cmp_op = cop;
+    plan->limit_expr = rhs;
+
+    IrExpr *cur = loop_br;
+    while (cur && cur->op == CB_LET) {
+        if (cur->arg[0]->has_call) return 0;
+        plan->let_vals[cur->index] = cur->arg[0];
+        plan->let_order[plan->num_lets++] = cur->index;
+        cur = cur->arg[1];
+    }
+    if (!cur || cur->op != CB_CALL || cur->index != fn_idx) return 0;
+    for (int i = 0; i < fn->arity; ++i) plan->next_args[i] = cur->arg[i];
+
+    const IrExpr *step_e = resolve_let_var(plan->next_args[plan->idx_param], plan->let_vals);
+    if (!step_e || step_e->op != CB_ADD) return 0;
+    const IrExpr *sa = resolve_let_var(step_e->arg[0], plan->let_vals);
+    const IrExpr *sb = resolve_let_var(step_e->arg[1], plan->let_vals);
+    if (!(sa->op == CB_VAR && sa->index == plan->idx_param && sb->op == CB_CONST && sb->value == 1)) return 0;
+
+    uint8_t inv_param[4] = {0, 0, 0, 0};
+    for (int i = 0; i < fn->arity; ++i) {
+        if (i != plan->idx_param) {
+            const IrExpr *na = resolve_let_var(plan->next_args[i], plan->let_vals);
+            if (na->op == CB_VAR && na->index == i) inv_param[i] = 1;
+        }
+    }
+    if (!is_loop_invariant_expr(plan->limit_expr, fn->arity, inv_param)) return 0;
+    *loop_br_out = loop_br;
+    return 1;
+}
+
+static int try_emit_avx2_loop(IrProgram *prog, FnEmit *s) {
+    VecLoopPlan plan;
+    IrExpr *loop_br = NULL;
+    if (!parse_simple_loop(prog, s->fn_idx, &plan, &loop_br)) return 0;
+
+    int arity = s->fn->arity;
+    if (arity < 2) return 0;
+    uint8_t inv_param[4] = {0, 0, 0, 0};
+    for (int i = 0; i < arity; ++i) {
+        if (i != plan.idx_param) {
+            const IrExpr *na = resolve_let_var(plan.next_args[i], plan.let_vals);
+            if (na->op == CB_VAR && na->index == i) inv_param[i] = 1;
+        }
+    }
+
+    int num_accs = 0;
+    int single_acc_param = -1;
+    for (int i = 0; i < arity; ++i) {
+        if (i == plan.idx_param) continue;
+        if (!match_acc_update(prog, i, plan.next_args[i], arity, plan.idx_param, inv_param, plan.let_vals, &plan.acc[i]))
+            return 0;
+        if (plan.acc[i].kind != RED_INVARIANT) {
+            num_accs++;
+            single_acc_param = i;
+        }
+    }
+    if (num_accs == 0 || num_accs > 3) return 0;
+
+    for (int i = 0; i < arity; ++i) {
+        if (i == plan.idx_param || plan.acc[i].kind == RED_INVARIANT) continue;
+        if (!can_vec_expr(plan.acc[i].rhs, &plan, arity, inv_param, 0)) return 0;
+    }
+
+    int next_cache_ymm = 8;
+    for (int k = 0; k < plan.num_lets && next_cache_ymm <= 8; ++k) {
+        int slot = plan.let_order[k];
+        int uses = 0;
+        for (int i = 0; i < arity; ++i) {
+            if (i != plan.idx_param && plan.acc[i].kind != RED_INVARIANT)
+                uses += count_var_uses(plan.acc[i].rhs, slot);
+        }
+        if (uses >= 2 && !expr_refs_any_acc(plan.let_vals[slot], arity, plan.idx_param, inv_param, plan.let_vals)) {
+            if (can_vec_expr(plan.let_vals[slot], &plan, arity, inv_param, 0)) {
+                plan.let_ymm[slot] = next_cache_ymm++;
+            }
+        }
+    }
+
+    FILE *f = s->out;
+    int ri = s->local_reg[plan.idx_param];
+    emit_expr(s, plan.limit_expr, 0, 0);
+    if (plan.has_get) {
+        if (plan.max_get_offset == 0) {
+            fprintf(f, "  cmpq %%r15, %%rax\n  cmovaq %%r15, %%rax\n");
+        } else {
+            fprintf(f, "  xorl %%ecx, %%ecx\n  movq %%r15, %%rdx\n  subq $%" PRIu64 ", %%rdx\n"
+                       "  cmovbq %%rcx, %%rdx\n  cmpq %%rdx, %%rax\n  cmovaq %%rdx, %%rax\n",
+                    plan.max_get_offset);
+        }
+    }
+    fprintf(f, "  cmpq %%rax, %s\n  jae .Lloop_fn%d\n"
+               "  movq %%rax, %%rdx\n  subq %s, %%rdx\n"
+               "  cmpq $4, %%rdx\n  jb .Lloop_fn%d\n",
+            reg64_name[ri], s->fn_idx, reg64_name[ri], s->fn_idx);
+
+    if (plan.uses_idx_vec) {
+        fprintf(f, "  vmovq %s, %%xmm15\n  vpbroadcastq %%xmm15, %%ymm15\n"
+                   "  movl $0x03020100, %%eax\n  vmovd %%eax, %%xmm10\n"
+                   "  vpmovzxbd %%xmm10, %%xmm10\n  vpmovzxdq %%xmm10, %%ymm10\n"
+                   "  vpaddq %%ymm10, %%ymm15, %%ymm15\n",
+                reg64_name[ri]);
+    }
+
+    int acc_ymm_map[4] = {-1, -1, -1, -1};
+    int cur_acc_ymm = 12;
+    for (int i = 0; i < arity; ++i) {
+        if (i == plan.idx_param || plan.acc[i].kind == RED_INVARIANT) continue;
+        int ay = cur_acc_ymm++;
+        acc_ymm_map[i] = ay;
+        RedKind rk = plan.acc[i].kind;
+        int r_acc = s->local_reg[i];
+        if (rk == RED_ADD || rk == RED_SUB || rk == RED_XOR || rk == RED_OR) {
+            fprintf(f, "  vpxor %%ymm%d, %%ymm%d, %%ymm%d\n", ay, ay, ay);
+        } else if (rk == RED_AND) {
+            fprintf(f, "  vpcmpeqq %%ymm%d, %%ymm%d, %%ymm%d\n", ay, ay, ay);
+        } else if (rk == RED_MUL) {
+            emit_vec_bcast_const(f, 1, ay);
+        } else if (rk == RED_MAX || rk == RED_MIN) {
+            fprintf(f, "  vmovq %s, %%xmm%d\n  vpbroadcastq %%xmm%d, %%ymm%d\n", reg64_name[r_acc], ay, ay, ay);
+            emit_vec_bcast_const(f, 0x8000000000000000ULL, 10);
+            fprintf(f, "  vpxor %%ymm10, %%ymm%d, %%ymm%d\n", ay, ay);
+        } else if (rk == RED_AFFINE) {
+            fprintf(f, "  vmovq %s, %%xmm%d\n  vpermq $0x3f, %%ymm%d, %%ymm%d\n", reg64_name[r_acc], ay, ay, ay);
+        }
+    }
+
+    int can_unroll8 = (num_accs == 1 && !plan.uses_idx_vec && next_cache_ymm == 8 &&
+                       plan.acc[single_acc_param].kind != RED_AFFINE);
+    if (can_unroll8) {
+        unsigned skip8_lbl = s->label++;
+        unsigned loop8_lbl = s->label++;
+        RedKind rk = plan.acc[single_acc_param].kind;
+        fprintf(f, "  cmpq $8, %%rdx\n  jb .L%u\n"
+                   "  movq %%rdx, %%rcx\n  andq $-8, %%rcx\n  addq %s, %%rcx\n",
+                skip8_lbl, reg64_name[ri]);
+        if (rk == RED_ADD || rk == RED_SUB || rk == RED_XOR || rk == RED_OR)
+            fprintf(f, "  vpxor %%ymm13, %%ymm13, %%ymm13\n");
+        else if (rk == RED_AND)
+            fprintf(f, "  vpcmpeqq %%ymm13, %%ymm13, %%ymm13\n");
+        else
+            fprintf(f, "  vmovdqa %%ymm12, %%ymm13\n");
+
+        fprintf(f, ".p2align 4\n.L%u:\n", loop8_lbl);
+        emit_vec_expr(s, &plan, plan.acc[single_acc_param].rhs, 0, 0);
+        emit_vec_acc_update(f, &plan.acc[single_acc_param], 12, 0);
+        emit_vec_expr(s, &plan, plan.acc[single_acc_param].rhs, 0, 4);
+        emit_vec_acc_update(f, &plan.acc[single_acc_param], 13, 0);
+        fprintf(f, "  addq $8, %s\n  cmpq %%rcx, %s\n  jb .L%u\n",
+                reg64_name[ri], reg64_name[ri], loop8_lbl);
+
+        if (rk == RED_ADD || rk == RED_SUB) fprintf(f, "  vpaddq %%ymm13, %%ymm12, %%ymm12\n");
+        else if (rk == RED_XOR) fprintf(f, "  vpxor %%ymm13, %%ymm12, %%ymm12\n");
+        else if (rk == RED_OR)  fprintf(f, "  vpor %%ymm13, %%ymm12, %%ymm12\n");
+        else if (rk == RED_AND) fprintf(f, "  vpand %%ymm13, %%ymm12, %%ymm12\n");
+        else if (rk == RED_MUL) emit_vec_mul64(f, 12, 13, 10, 11);
+        else if (rk == RED_MAX || rk == RED_MIN) {
+            if (rk == RED_MAX) fprintf(f, "  vpcmpgtq %%ymm12, %%ymm13, %%ymm10\n");
+            else fprintf(f, "  vpcmpgtq %%ymm13, %%ymm12, %%ymm10\n");
+            fprintf(f, "  vpxor %%ymm12, %%ymm13, %%ymm13\n"
+                       "  vpand %%ymm10, %%ymm13, %%ymm13\n"
+                       "  vpxor %%ymm13, %%ymm12, %%ymm12\n");
+        }
+        fprintf(f, ".L%u:\n", skip8_lbl);
+    }
+
+    unsigned skip4_lbl = s->label++;
+    unsigned loop4_lbl = s->label++;
+    fprintf(f, "  andq $-4, %%rdx\n  addq %s, %%rdx\n", reg64_name[s->local_reg[plan.idx_param]]);
+    if (can_unroll8) {
+        fprintf(f, "  subq $8, %%rdx\n");
+    }
+    if (can_unroll8) {
+        fprintf(f, "  addq $8, %%rdx\n");
+    }
+    fprintf(f, ".L%u_chk:\n", loop4_lbl);
+    if (can_unroll8) {
+        /* Recompute exact 4-aligned end from original start + (rem & -4) already in %rdx?
+           Wait: %ri was incremented in loop8! Let's compute %rdx BEFORE loop8! */
+    }
+    return 0;
+}
+
+static int emit_avx2_fastpath(IrProgram *prog, FnEmit *s) {
+    (void)try_emit_avx2_loop;
+    VecLoopPlan plan;
+    IrExpr *loop_br = NULL;
+    if (!parse_simple_loop(prog, s->fn_idx, &plan, &loop_br)) return 0;
+
+    int arity = s->fn->arity;
+    if (arity < 2) return 0;
+    uint8_t inv_param[4] = {0, 0, 0, 0};
+    for (int i = 0; i < arity; ++i) {
+        if (i != plan.idx_param) {
+            const IrExpr *na = resolve_let_var(plan.next_args[i], plan.let_vals);
+            if (na->op == CB_VAR && na->index == i) inv_param[i] = 1;
+        }
+    }
+
+    int num_accs = 0;
+    int single_acc_param = -1;
+    for (int i = 0; i < arity; ++i) {
+        if (i == plan.idx_param) continue;
+        if (!match_acc_update(prog, i, plan.next_args[i], arity, plan.idx_param, inv_param, plan.let_vals, &plan.acc[i]))
+            return 0;
+        if (plan.acc[i].kind != RED_INVARIANT) {
+            num_accs++;
+            single_acc_param = i;
+        }
+    }
+    if (num_accs == 0 || num_accs > 3) return 0;
+
+    for (int i = 0; i < arity; ++i) {
+        if (i == plan.idx_param || plan.acc[i].kind == RED_INVARIANT) continue;
+        if (!can_vec_expr(plan.acc[i].rhs, &plan, arity, inv_param, 0)) return 0;
+    }
+
+    int next_cache_ymm = 8;
+    for (int k = 0; k < plan.num_lets && next_cache_ymm <= 8; ++k) {
+        int slot = plan.let_order[k];
+        int uses = 0;
+        for (int i = 0; i < arity; ++i) {
+            if (i != plan.idx_param && plan.acc[i].kind != RED_INVARIANT)
+                uses += count_var_uses(plan.acc[i].rhs, slot);
+        }
+        if (uses >= 2 && !expr_refs_any_acc(plan.let_vals[slot], arity, plan.idx_param, inv_param, plan.let_vals)) {
+            if (can_vec_expr(plan.let_vals[slot], &plan, arity, inv_param, 0)) {
+                plan.let_ymm[slot] = next_cache_ymm++;
+            }
+        }
+    }
+
+    FILE *f = s->out;
+    int ri = s->local_reg[plan.idx_param];
+    emit_expr(s, plan.limit_expr, 0, 0);
+    if (plan.has_get) {
+        if (plan.max_get_offset == 0) {
+            fprintf(f, "  cmpq %%r15, %%rax\n  cmovaq %%r15, %%rax\n");
+        } else {
+            fprintf(f, "  xorl %%ecx, %%ecx\n  movq %%r15, %%rdx\n  subq $%" PRIu64 ", %%rdx\n"
+                       "  cmovbq %%rcx, %%rdx\n  cmpq %%rdx, %%rax\n  cmovaq %%rdx, %%rax\n",
+                    plan.max_get_offset);
+        }
+    }
+    fprintf(f, "  cmpq %%rax, %s\n  jae .Lloop_fn%d\n"
+               "  movq %%rax, %%rdx\n  subq %s, %%rdx\n"
+               "  cmpq $4, %%rdx\n  jb .Lloop_fn%d\n"
+               "  movq %%rdx, %%rcx\n"
+               "  andq $-4, %%rdx\n  addq %s, %%rdx\n",
+            reg64_name[ri], s->fn_idx, reg64_name[ri], s->fn_idx, reg64_name[ri]);
+
+    if (plan.uses_idx_vec) {
+        fprintf(f, "  vmovq %s, %%xmm15\n  vpbroadcastq %%xmm15, %%ymm15\n"
+                   "  movl $0x03020100, %%eax\n  vmovd %%eax, %%xmm10\n"
+                   "  vpmovzxbd %%xmm10, %%xmm10\n  vpmovzxdq %%xmm10, %%ymm10\n"
+                   "  vpaddq %%ymm10, %%ymm15, %%ymm15\n",
+                reg64_name[ri]);
+    }
+
+    int acc_ymm_map[4] = {-1, -1, -1, -1};
+    int cur_acc_ymm = 12;
+    for (int i = 0; i < arity; ++i) {
+        if (i == plan.idx_param || plan.acc[i].kind == RED_INVARIANT) continue;
+        int ay = cur_acc_ymm++;
+        acc_ymm_map[i] = ay;
+        RedKind rk = plan.acc[i].kind;
+        int r_acc = s->local_reg[i];
+        if (rk == RED_ADD || rk == RED_SUB || rk == RED_XOR || rk == RED_OR) {
+            fprintf(f, "  vpxor %%ymm%d, %%ymm%d, %%ymm%d\n", ay, ay, ay);
+        } else if (rk == RED_AND) {
+            fprintf(f, "  vpcmpeqq %%ymm%d, %%ymm%d, %%ymm%d\n", ay, ay, ay);
+        } else if (rk == RED_MUL) {
+            emit_vec_bcast_const(f, 1, ay);
+        } else if (rk == RED_MAX || rk == RED_MIN) {
+            fprintf(f, "  vmovq %s, %%xmm%d\n  vpbroadcastq %%xmm%d, %%ymm%d\n", reg64_name[r_acc], ay, ay, ay);
+            emit_vec_bcast_const(f, 0x8000000000000000ULL, 10);
+            fprintf(f, "  vpxor %%ymm10, %%ymm%d, %%ymm%d\n", ay, ay);
+        } else if (rk == RED_AFFINE) {
+            fprintf(f, "  vmovq %s, %%xmm%d\n  vpermq $0x3f, %%ymm%d, %%ymm%d\n", reg64_name[r_acc], ay, ay, ay);
+        }
+    }
+
+    int can_unroll8 = (num_accs == 1 && !plan.uses_idx_vec && next_cache_ymm == 8 &&
+                       plan.acc[single_acc_param].kind != RED_AFFINE);
+    if (can_unroll8) {
+        unsigned skip8_lbl = s->label++;
+        unsigned loop8_lbl = s->label++;
+        RedKind rk = plan.acc[single_acc_param].kind;
+        fprintf(f, "  cmpq $8, %%rcx\n  jb .L%u\n"
+                   "  andq $-8, %%rcx\n  addq %s, %%rcx\n",
+                skip8_lbl, reg64_name[ri]);
+        if (rk == RED_ADD || rk == RED_SUB || rk == RED_XOR || rk == RED_OR)
+            fprintf(f, "  vpxor %%ymm13, %%ymm13, %%ymm13\n");
+        else if (rk == RED_AND)
+            fprintf(f, "  vpcmpeqq %%ymm13, %%ymm13, %%ymm13\n");
+        else
+            fprintf(f, "  vmovdqa %%ymm12, %%ymm13\n");
+
+        fprintf(f, ".p2align 4\n.L%u:\n", loop8_lbl);
+        emit_vec_expr(s, &plan, plan.acc[single_acc_param].rhs, 0, 0);
+        emit_vec_acc_update(f, &plan.acc[single_acc_param], 12, 0);
+        emit_vec_expr(s, &plan, plan.acc[single_acc_param].rhs, 0, 4);
+        emit_vec_acc_update(f, &plan.acc[single_acc_param], 13, 0);
+        fprintf(f, "  addq $8, %s\n  cmpq %%rcx, %s\n  jb .L%u\n",
+                reg64_name[ri], reg64_name[ri], loop8_lbl);
+
+        if (rk == RED_ADD || rk == RED_SUB) fprintf(f, "  vpaddq %%ymm13, %%ymm12, %%ymm12\n");
+        else if (rk == RED_XOR) fprintf(f, "  vpxor %%ymm13, %%ymm12, %%ymm12\n");
+        else if (rk == RED_OR)  fprintf(f, "  vpor %%ymm13, %%ymm12, %%ymm12\n");
+        else if (rk == RED_AND) fprintf(f, "  vpand %%ymm13, %%ymm12, %%ymm12\n");
+        else if (rk == RED_MUL) emit_vec_mul64(f, 12, 13, 10, 11);
+        else if (rk == RED_MAX || rk == RED_MIN) {
+            if (rk == RED_MAX) fprintf(f, "  vpcmpgtq %%ymm12, %%ymm13, %%ymm10\n");
+            else fprintf(f, "  vpcmpgtq %%ymm13, %%ymm12, %%ymm10\n");
+            fprintf(f, "  vpxor %%ymm12, %%ymm13, %%ymm13\n"
+                       "  vpand %%ymm10, %%ymm13, %%ymm13\n"
+                       "  vpxor %%ymm13, %%ymm12, %%ymm12\n");
+        }
+        fprintf(f, ".L%u:\n  cmpq %%rdx, %s\n  jae .L%u_done\n", skip8_lbl, reg64_name[ri], skip8_lbl);
+        unsigned loop4_lbl = s->label++;
+        fprintf(f, ".p2align 4\n.L%u:\n", loop4_lbl);
+        emit_vec_expr(s, &plan, plan.acc[single_acc_param].rhs, 0, 0);
+        emit_vec_acc_update(f, &plan.acc[single_acc_param], 12, 0);
+        fprintf(f, "  addq $4, %s\n  cmpq %%rdx, %s\n  jb .L%u\n.L%u_done:\n",
+                reg64_name[ri], reg64_name[ri], loop4_lbl, skip8_lbl);
+    } else {
+        unsigned loop4_lbl = s->label++;
+        fprintf(f, ".p2align 4\n.L%u:\n", loop4_lbl);
+        for (int k = 0; k < plan.num_lets; ++k) {
+            int slot = plan.let_order[k];
+            if (plan.let_ymm[slot] >= 0) {
+                emit_vec_expr(s, &plan, plan.let_vals[slot], 0, 0);
+                fprintf(f, "  vmovdqa %%ymm0, %%ymm%d\n", plan.let_ymm[slot]);
+            }
+        }
+        for (int i = 0; i < arity; ++i) {
+            if (i == plan.idx_param || plan.acc[i].kind == RED_INVARIANT) continue;
+            emit_vec_expr(s, &plan, plan.acc[i].rhs, 0, 0);
+            emit_vec_acc_update(f, &plan.acc[i], acc_ymm_map[i], 0);
+        }
+        if (plan.uses_idx_vec) {
+            emit_vec_bcast_const(f, 4, 10);
+            fprintf(f, "  vpaddq %%ymm10, %%ymm15, %%ymm15\n");
+        }
+        fprintf(f, "  addq $4, %s\n  cmpq %%rdx, %s\n  jb .L%u\n",
+                reg64_name[ri], reg64_name[ri], loop4_lbl);
+    }
+
+    for (int i = 0; i < arity; ++i) {
+        if (i == plan.idx_param || plan.acc[i].kind == RED_INVARIANT) continue;
+        int ay = acc_ymm_map[i];
+        int r_acc = s->local_reg[i];
+        RedKind rk = plan.acc[i].kind;
+        if (rk == RED_ADD || rk == RED_SUB || rk == RED_XOR || rk == RED_OR || rk == RED_AND) {
+            const char *vop = (rk == RED_ADD || rk == RED_SUB) ? "vpaddq" :
+                              (rk == RED_XOR) ? "vpxor" : (rk == RED_OR ? "vpor" : "vpand");
+            const char *sop = (rk == RED_ADD) ? "addq" : (rk == RED_SUB ? "subq" :
+                              (rk == RED_XOR) ? "xorq" : (rk == RED_OR ? "orq" : "andq"));
+            fprintf(f, "  vextracti128 $1, %%ymm%d, %%xmm0\n"
+                       "  %s %%xmm0, %%xmm%d, %%xmm%d\n"
+                       "  vpshufd $0x4e, %%xmm%d, %%xmm0\n"
+                       "  %s %%xmm0, %%xmm%d, %%xmm%d\n"
+                       "  vmovq %%xmm%d, %%rax\n"
+                       "  %s %%rax, %s\n",
+                    ay, vop, ay, ay, ay, vop, ay, ay, ay, sop, reg64_name[r_acc]);
+        } else if (rk == RED_MUL) {
+            fprintf(f, "  vmovq %%xmm%d, %%rax\n  imulq %%rax, %s\n"
+                       "  vpextrq $1, %%xmm%d, %%rax\n  imulq %%rax, %s\n"
+                       "  vextracti128 $1, %%ymm%d, %%xmm0\n"
+                       "  vmovq %%xmm0, %%rax\n  imulq %%rax, %s\n"
+                       "  vpextrq $1, %%xmm0, %%rax\n  imulq %%rax, %s\n",
+                    ay, reg64_name[r_acc], ay, reg64_name[r_acc], ay, reg64_name[r_acc], reg64_name[r_acc]);
+        } else if (rk == RED_MAX || rk == RED_MIN) {
+            const char *cmov = (rk == RED_MAX) ? "cmovaq" : "cmovbq";
+            emit_vec_bcast_const(f, 0x8000000000000000ULL, 10);
+            fprintf(f, "  vpxor %%ymm10, %%ymm%d, %%ymm%d\n"
+                       "  vmovq %%xmm%d, %%rax\n  cmpq %s, %%rax\n  %s %%rax, %s\n"
+                       "  vpextrq $1, %%xmm%d, %%rax\n  cmpq %s, %%rax\n  %s %%rax, %s\n"
+                       "  vextracti128 $1, %%ymm%d, %%xmm0\n"
+                       "  vmovq %%xmm0, %%rax\n  cmpq %s, %%rax\n  %s %%rax, %s\n"
+                       "  vpextrq $1, %%xmm0, %%rax\n  cmpq %s, %%rax\n  %s %%rax, %s\n",
+                    ay, ay,
+                    ay, reg64_name[r_acc], cmov, reg64_name[r_acc],
+                    ay, reg64_name[r_acc], cmov, reg64_name[r_acc],
+                    ay,
+                    reg64_name[r_acc], cmov, reg64_name[r_acc],
+                    reg64_name[r_acc], cmov, reg64_name[r_acc]);
+        } else if (rk == RED_AFFINE) {
+            emit_load_const(f, plan.acc[i].affine_c, REG_RCX);
+            fprintf(f, "  vmovq %%xmm%d, %s\n  imulq %%rcx, %s\n"
+                       "  vpextrq $1, %%xmm%d, %%rax\n  addq %%rax, %s\n  imulq %%rcx, %s\n"
+                       "  vextracti128 $1, %%ymm%d, %%xmm0\n"
+                       "  vmovq %%xmm0, %%rax\n  addq %%rax, %s\n  imulq %%rcx, %s\n"
+                       "  vpextrq $1, %%xmm0, %%rax\n  addq %%rax, %s\n",
+                    ay, reg64_name[r_acc], reg64_name[r_acc],
+                    ay, reg64_name[r_acc], reg64_name[r_acc],
+                    ay,
+                    reg64_name[r_acc], reg64_name[r_acc],
+                    reg64_name[r_acc]);
+        }
+    }
+    return 1;
+}
+
+static int check_only_safe_gets(const IrExpr *e, int idx_param, int *has_get, uint64_t *max_off) {
+    if (!e) return 1;
+    if (e->op == CB_GET) {
+        uint64_t off = 0;
+        if (!is_get_var_with_offset(e, idx_param, &off)) return 0;
+        *has_get = 1;
+        if (off > *max_off) *max_off = off;
+        return 1;
+    }
+    int nchild = (e->op == CB_IF) ? 3 : (e->op == CB_LET ? 2 : (e->op == CB_CALL ? e->argc : (e->op >= CB_ADD ? 2 : 0)));
+    for (int i = 0; i < nchild; ++i)
+        if (!check_only_safe_gets(e->arg[i], idx_param, has_get, max_off)) return 0;
+    return 1;
+}
+
+static int try_emit_unrolled_scalar_loop(IrProgram *prog, FnEmit *s) {
+    VecLoopPlan plan;
+    IrExpr *loop_br = NULL;
+    if (!parse_simple_loop(prog, s->fn_idx, &plan, &loop_br)) return 0;
+    if (loop_br->size > 48 || s->num_call_safe == 0) return 0;
+    if (!check_only_safe_gets(loop_br, plan.idx_param, &plan.has_get, &plan.max_get_offset)) return 0;
+
+    int limit_reg = s->call_safe_regs[0];
+    int ri = s->local_reg[plan.idx_param];
+    FILE *f = s->out;
+    emit_expr(s, plan.limit_expr, 0, 0);
+    if (plan.has_get) {
+        if (plan.max_get_offset == 0) {
+            fprintf(f, "  cmpq %%r15, %%rax\n  cmovaq %%r15, %%rax\n");
+        } else {
+            fprintf(f, "  xorl %%ecx, %%ecx\n  movq %%r15, %%rdx\n  subq $%" PRIu64 ", %%rdx\n"
+                       "  cmovbq %%rcx, %%rdx\n  cmpq %%rdx, %%rax\n  cmovaq %%rdx, %%rax\n",
+                    plan.max_get_offset);
+        }
+    }
+    fprintf(f, "  cmpq %%rax, %s\n  jae .Lloop_fn%d\n"
+               "  movq %%rax, %s\n  subq %s, %s\n"
+               "  cmpq $4, %s\n  jb .Lloop_fn%d\n"
+               "  andq $-4, %s\n  addq %s, %s\n",
+            reg64_name[ri], s->fn_idx,
+            reg64_name[limit_reg], reg64_name[ri], reg64_name[limit_reg],
+            reg64_name[limit_reg], s->fn_idx,
+            reg64_name[limit_reg], reg64_name[ri], reg64_name[limit_reg]);
+
+    unsigned uloop_lbl = s->label++;
+    fprintf(f, ".p2align 4\n.L%u:\n", uloop_lbl);
+    s->unroll_in_bounds_param = plan.idx_param;
+    for (int u = 0; u < 4; ++u) {
+        IrExpr *cur = loop_br;
+        while (cur && cur->op == CB_LET) {
+            emit_expr(s, cur->arg[0], 0, 1);
+            emit_store_local(s, REG_RAX, cur->index);
+            cur = cur->arg[1];
+        }
+        emit_call_args(s, cur, s->local_reg, s->local_stack_slot, 0, 1);
+    }
+    s->unroll_in_bounds_param = -1;
+    fprintf(f, "  cmpq %s, %s\n  jb .L%u\n", reg64_name[limit_reg], reg64_name[ri], uloop_lbl);
+    return 1;
+}
+
+static void compute_max_spills(const IrExpr *e, int num_scratch, int cur_scratch, int cur_spill, int *max_spill) {
+    if (!e) return;
+    if (cur_spill > *max_spill) *max_spill = cur_spill;
+    if (e->op == CB_GET) {
+        compute_max_spills(e->arg[0], num_scratch, cur_scratch, cur_spill, max_spill);
+    } else if (e->op == CB_LET) {
+        compute_max_spills(e->arg[0], num_scratch, cur_scratch, cur_spill, max_spill);
+        compute_max_spills(e->arg[1], num_scratch, cur_scratch, cur_spill, max_spill);
+    } else if (e->op == CB_IF) {
+        compute_max_spills(e->arg[0], num_scratch, cur_scratch + 1, cur_spill, max_spill);
+        compute_max_spills(e->arg[1], num_scratch, cur_scratch + 1, cur_spill, max_spill);
+        compute_max_spills(e->arg[2], num_scratch, cur_scratch + 1, cur_spill, max_spill);
+    } else if (e->op == CB_CALL) {
+        int sc = cur_scratch, sp = cur_spill;
+        for (int i = 0; i < e->argc; ++i) {
+            if (is_trivial_expr(e->arg[i])) continue;
+            compute_max_spills(e->arg[i], num_scratch, sc, sp, max_spill);
+            int later_call = 0;
+            for (int j = i + 1; j < e->argc; ++j)
+                if (e->arg[j]->has_call) later_call = 1;
+            if (!later_call && sc < num_scratch) sc++;
+            else sp++;
+            if (sp > *max_spill) *max_spill = sp;
+        }
+    } else if (e->op >= CB_ADD) {
+        const IrExpr *a = e->arg[0], *b = e->arg[1];
+        if (is_trivial_expr(b)) {
+            compute_max_spills(a, num_scratch, cur_scratch, cur_spill, max_spill);
+        } else if (is_trivial_expr(a)) {
+            compute_max_spills(b, num_scratch, cur_scratch, cur_spill, max_spill);
+        } else if (!b->has_call && cur_scratch < num_scratch) {
+            compute_max_spills(a, num_scratch, cur_scratch, cur_spill, max_spill);
+            compute_max_spills(b, num_scratch, cur_scratch + 1, cur_spill, max_spill);
+        } else {
+            compute_max_spills(a, num_scratch, cur_scratch, cur_spill, max_spill);
+            compute_max_spills(b, num_scratch, cur_scratch, cur_spill + 1, max_spill);
+        }
+    }
+}
+
+static int detect_right_spine_recursion(const IrFunction *fn, int fn_idx, CbOp *op_out, uint64_t *ident_out) {
+    if (fn->locals > 2 || fn->body->op != CB_IF || fn->body->arg[0]->has_call) return 0;
+    const IrExpr *t = fn->body->arg[1], *f = fn->body->arg[2];
+    int tc = 0, fc = 0;
+    if (!calls_only_target(t, fn_idx, &tc) || !calls_only_target(f, fn_idx, &fc)) return 0;
+    const IrExpr *rec = NULL;
+    if (tc > 0 && fc == 0) rec = t;
+    else if (fc > 0 && tc == 0) rec = f;
+    else return 0;
+    uint64_t id = 0;
+    if (!is_assoc_op(rec->op, &id)) return 0;
+    if ((rec->arg[1]->op == CB_CALL && rec->arg[1]->index == fn_idx) ||
+        (rec->arg[0]->op == CB_CALL && rec->arg[0]->index == fn_idx)) {
+        *op_out = rec->op;
+        *ident_out = id;
+        return 1;
+    }
+    return 0;
+}
+
+static void emit_function(IrProgram *prog, FILE *out, int fn_idx, unsigned *label_counter) {
+    FnEmit s;
+    memset(&s, 0, sizeof(s));
+    s.out = out;
+    s.prog = prog;
+    s.fn = &prog->fn[fn_idx];
+    s.fn_idx = fn_idx;
+    s.label = *label_counter;
+    s.unroll_in_bounds_param = -1;
+    for (int i = 0; i < MAX_IR_LOCALS; ++i) {
+        s.local_reg[i] = REG_NONE;
+        s.local_stack_slot[i] = -1;
+    }
+
+    int self_calls = 0;
+    s.is_leaf_loop = is_self_tail_only(s.fn->body, fn_idx, 1, &self_calls);
+
+    if (s.is_leaf_loop) {
+        static const int leaf_regs[9] = {
+            REG_RDI, REG_RSI, REG_R8, REG_R9, REG_R10, REG_R11, REG_RBX, REG_R12, REG_R13
+        };
+        for (int i = 0; i < s.fn->locals; ++i) {
+            if (i < 9) {
+                s.local_reg[i] = leaf_regs[i];
+                if (i == 6) s.used_callee[0] = 1;
+                if (i == 7) s.used_callee[1] = 1;
+                if (i == 8) s.used_callee[2] = 1;
+            } else {
+                s.local_stack_slot[i] = s.base_stack_slots++;
+            }
+        }
+        int start_sc = s.fn->locals > s.fn->arity ? s.fn->locals : s.fn->arity;
+        for (int i = start_sc; i < 6; ++i) s.scratch_regs[s.num_scratch++] = leaf_regs[i];
+        for (int i = (start_sc > 6 ? start_sc : 6); i < 9; ++i) {
+            s.call_safe_regs[s.num_call_safe++] = leaf_regs[i];
+        }
+    } else {
+        static const int callee_pool[3] = { REG_RBX, REG_R12, REG_R13 };
+        uint64_t rs_ident = 0;
+        if (detect_right_spine_recursion(s.fn, fn_idx, &s.right_spine_op, &rs_ident)) {
+            s.right_spine_loop = 1;
+            s.right_spine_reg = REG_R13;
+            s.used_callee[2] = 1;
+        }
+        int max_c = s.right_spine_loop ? 2 : 3;
+        for (int i = 0; i < s.fn->locals; ++i) {
+            if (i < max_c) {
+                s.local_reg[i] = callee_pool[i];
+                s.used_callee[i] = 1;
+            } else {
+                s.local_stack_slot[i] = s.base_stack_slots++;
+            }
+        }
+        for (int i = s.fn->locals; i < max_c; ++i) {
+            s.call_safe_regs[s.num_call_safe++] = callee_pool[i];
+        }
+        s.scratch_regs[s.num_scratch++] = REG_R10;
+        s.scratch_regs[s.num_scratch++] = REG_R11;
+    }
+
+    int max_sp = 0;
+    compute_max_spills(s.fn->body, s.num_scratch, 0, 0, &max_sp);
+    if (s.is_leaf_loop && self_calls > 0 && max_sp == 0 && s.num_call_safe > 0) {
+        max_sp = 1;
+    }
+    for (int i = 0; i < max_sp && i < s.num_call_safe; ++i) {
+        int r = s.call_safe_regs[i];
+        if (r == REG_RBX) s.used_callee[0] = 1;
+        if (r == REG_R12) s.used_callee[1] = 1;
+        if (r == REG_R13) s.used_callee[2] = 1;
+    }
+    int stack_spills = (max_sp > s.num_call_safe) ? (max_sp - s.num_call_safe) : 0;
+    int total_slots = s.base_stack_slots + stack_spills;
+    int pushed_callee = s.used_callee[0] + s.used_callee[1] + s.used_callee[2];
+
+    if (!s.is_leaf_loop || pushed_callee > 0 || total_slots > 0) {
+        s.has_frame = 1;
+        int total_bytes = (pushed_callee + total_slots) * 8;
+        int aligned_bytes = (total_bytes + 15) & ~15;
+        s.frame_sub_bytes = aligned_bytes - pushed_callee * 8;
+    }
+
+    fprintf(out, ".p2align 4\n.Lfn%d:\n", fn_idx);
+    if (s.has_frame) {
+        fprintf(out, "  pushq %%rbp\n  movq %%rsp, %%rbp\n");
+        if (s.used_callee[0]) fprintf(out, "  pushq %%rbx\n");
+        if (s.used_callee[1]) fprintf(out, "  pushq %%r12\n");
+        if (s.used_callee[2]) fprintf(out, "  pushq %%r13\n");
+        if (s.frame_sub_bytes > 0) fprintf(out, "  subq $%d, %%rsp\n", s.frame_sub_bytes);
+    }
+
+    if (!s.is_leaf_loop) {
+        for (int i = 0; i < s.fn->arity; ++i) {
+            emit_store_local(&s, param_regs[i], i);
+        }
+        if (s.right_spine_loop) {
+            uint64_t id = (s.right_spine_op == CB_MUL) ? 1ULL : (s.right_spine_op == CB_AND ? ~0ULL : 0ULL);
+            emit_load_const(out, id, s.right_spine_reg);
+        }
+    }
+
+    if (s.is_leaf_loop && self_calls == 1) {
+        if (!emit_avx2_fastpath(prog, &s)) {
+            try_emit_unrolled_scalar_loop(prog, &s);
+        }
+    }
+
+    fprintf(out, ".Lloop_fn%d:\n", fn_idx);
+    emit_tail(&s, s.fn->body);
+    *label_counter = s.label;
+}
+
+int cb_emit_assembly(const CbProgram *p, const char *path, char *error, size_t error_size) {
+    if (!p || !path) {
+        if (error && error_size > 0) snprintf(error, error_size, "invalid arguments");
+        return 0;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        if (error && error_size > 0) snprintf(error, error_size, "%s: %s", path, strerror(errno));
+        return 0;
+    }
+
+    IrProgram *prog = (IrProgram *)calloc(1, sizeof(IrProgram));
+    if (!prog) {
+        fclose(f);
+        if (error && error_size > 0) snprintf(error, error_size, "out of memory");
+        return 0;
+    }
+
+    prog->functions = p->functions;
+    prog->entry = p->entry;
+    for (int i = 0; i < p->functions; ++i) {
+        prog->fn[i].arity = p->fn[i].arity;
+        prog->fn[i].locals = p->fn[i].locals;
+        prog->fn[i].body = copy_from_cb(prog, p->fn[i].body);
+        update_meta(prog->fn[i].body);
+        simplify_fn(prog, i);
+    }
+
+    for (int round = 0; round < 6; ++round) {
+        int changed = 0;
+        for (int i = 0; i < prog->functions; ++i) {
+            prog->fn[i].body = inline_calls_in_expr(prog, i, prog->fn[i].body, round >= 3, &changed);
+            if (changed) simplify_fn(prog, i);
+        }
+        if (!changed && round >= 3) break;
+    }
+
+    convert_linear_rec_to_loop(prog);
+
+    for (int i = 0; i < prog->functions; ++i) {
+        int sc = 0;
+        if (is_self_tail_only(prog->fn[i].body, i, 1, &sc) && sc > 1) {
+            IrExpr *b = prog->fn[i].body;
+            if (b->op == CB_IF) {
+                b->arg[1] = merge_branch_tail_calls(prog, i, b->arg[1]);
+                b->arg[2] = merge_branch_tail_calls(prog, i, b->arg[2]);
+                update_meta(b);
+                simplify_fn(prog, i);
+            }
+        }
+    }
+
+    fprintf(f, ".text\n.globl bench_entry\n.type bench_entry, @function\n"
+               ".p2align 4\nbench_entry:\n"
+               "  pushq %%rbp\n  movq %%rsp, %%rbp\n"
+               "  pushq %%rbx\n  pushq %%r12\n  pushq %%r13\n  pushq %%r14\n  pushq %%r15\n"
+               "  subq $8, %%rsp\n"
+               "  movq %%rdi, %%r14\n  movq %%rsi, %%r15\n"
+               "  call .Lfn%d\n"
+               "  vzeroupper\n"
+               "  addq $8, %%rsp\n"
+               "  popq %%r15\n  popq %%r14\n  popq %%r13\n  popq %%r12\n  popq %%rbx\n  popq %%rbp\n"
+               "  ret\n"
+               ".size bench_entry, .-bench_entry\n",
+            prog->entry);
+
+    unsigned label_counter = 1;
+    for (int i = 0; i < prog->functions; ++i) {
+        emit_function(prog, f, i, &label_counter);
+    }
+
+    fprintf(f, ".section .note.GNU-stack,\"\",@progbits\n");
+    free(prog);
+    int ok = !ferror(f);
+    if (fclose(f)) ok = 0;
+    if (!ok && error && error_size > 0) snprintf(error, error_size, "could not write %s", path);
+    return ok;
+}

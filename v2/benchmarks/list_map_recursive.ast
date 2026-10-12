@@ -1,0 +1,5 @@
+(program
+  (fn main () (call map input))
+  (fn map (xs)
+    (if (is_nil xs) nil
+      (cons (div (head xs) (and (head xs) 7)) (call map (tail xs))))))

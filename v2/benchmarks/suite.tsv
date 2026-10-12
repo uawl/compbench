@@ -1,0 +1,15 @@
+# difficulty  timing-array-length  AST (relative to this file)
+1 8192 sum.ast
+1 8192 unsigned_max.ast
+2 8192 conditional_sum.ast
+2 8192 divmod.ast
+3 8192 mutual_recursion.ast
+3 8192 helper_mix.ast
+4 32 non_tail_sum.ast
+4 32 fibonacci.ast
+1 8192 list_sum.ast
+2 4096 list_reverse.ast
+2 4096 list_map.ast
+3 4096 list_sharing.ast
+3 4096 list_zip.ast
+4 32 list_map_recursive.ast

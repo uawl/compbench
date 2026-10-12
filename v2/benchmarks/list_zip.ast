@@ -1,0 +1,10 @@
+; Four parameters mix list and scalar values. Lists may share their tails.
+(program
+  (fn main () (call zip input (tail input) 0 nil))
+  (fn zip (xs ys i acc)
+    (if (is_nil xs) (call reverse acc nil)
+      (call zip (tail xs) (tail ys) (add i 1)
+        (cons (add (xor (head xs) (head ys)) i) acc))))
+  (fn reverse (xs acc)
+    (if (is_nil xs) acc
+      (call reverse (tail xs) (cons (head xs) acc)))))

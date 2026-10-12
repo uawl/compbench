@@ -1,0 +1,5 @@
+(program
+  (fn main () (call sum 0))
+  (fn sum (i)
+    (if (eq i len) 0
+      (add (get i) (call sum (add i 1))))))

@@ -1,0 +1,9 @@
+(program
+  (fn main () (call scan 0 0 0))
+  (fn scan (i total count)
+    (if (eq i len) (xor total (shl count 32))
+      (let x (get i)
+        (let keep (eq (and x 3) 0)
+          (call scan (add i 1)
+            (add total (if keep x 0))
+            (add count keep)))))))

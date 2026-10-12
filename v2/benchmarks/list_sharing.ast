@@ -1,0 +1,11 @@
+; Old lists must retain their contents after cons and recursive transforms.
+(program
+  (fn main ()
+    (let ys (call map_rev input nil)
+      (xor (call sum input 0) (call sum ys 0))))
+  (fn map_rev (xs acc)
+    (if (is_nil xs) acc
+      (call map_rev (tail xs) (cons (xor (head xs) 0x8000000000000000) acc))))
+  (fn sum (xs acc)
+    (if (is_nil xs) acc
+      (call sum (tail xs) (add acc (head xs))))))

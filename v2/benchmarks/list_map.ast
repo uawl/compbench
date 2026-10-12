@@ -1,0 +1,8 @@
+(program
+  (fn main () (call reverse (call map_rev input nil) nil))
+  (fn map_rev (xs acc)
+    (if (is_nil xs) acc
+      (call map_rev (tail xs) (cons (add (mul (head xs) 3) 1) acc))))
+  (fn reverse (xs acc)
+    (if (is_nil xs) acc
+      (call reverse (tail xs) (cons (head xs) acc)))))

@@ -1,0 +1,9 @@
+; Self-division is zero at x=0. A divisor of (x & 7) regularly becomes zero.
+(program
+  (fn main () (call scan 0 0))
+  (fn scan (i acc)
+    (if (eq i len) acc
+      (let x (get i)
+        (let d (and x 7)
+          (call scan (add i 1)
+            (add acc (xor (add (div x d) (mod x d)) (div x x)))))))))

@@ -1,0 +1,5 @@
+(program
+  (fn main () (call fib (and (get 0) 15)))
+  (fn fib (n)
+    (if (lt n 2) n
+      (add (call fib (sub n 1)) (call fib (sub n 2))))))

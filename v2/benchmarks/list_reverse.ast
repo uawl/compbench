@@ -1,0 +1,5 @@
+(program
+  (fn main () (call reverse input nil))
+  (fn reverse (xs acc)
+    (if (is_nil xs) acc
+      (call reverse (tail xs) (cons (head xs) acc)))))

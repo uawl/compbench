@@ -1,0 +1,5 @@
+(program
+  (fn main () (call sum input 0))
+  (fn sum (xs acc)
+    (if (is_nil xs) acc
+      (call sum (tail xs) (add acc (head xs))))))

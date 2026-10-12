@@ -1,0 +1,10 @@
+(program
+  (fn main () (call scan 0 0 0))
+  (fn mix (x)
+    (let y (xor x (shr x 33))
+      (let z (mul y 0xff51afd7ed558ccd)
+        (xor z (shr z 33)))))
+  (fn scan (i total parity)
+    (if (eq i len) (xor total parity)
+      (let x (call mix (get i))
+        (call scan (add i 1) (add total x) (xor parity x))))))
