@@ -1,0 +1,6 @@
+; The multiplier is runtime data, invariant throughout the loop.
+(program
+  (fn main () (call fold 0 17 (or (get 0) 1)))
+  (fn fold (i acc k)
+    (if (eq i len) acc
+      (call fold (add i 1) (add (mul acc k) (get i)) k))))

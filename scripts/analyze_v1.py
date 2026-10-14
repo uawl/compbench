@@ -63,7 +63,7 @@ def run():
         "gemini_no_mutual_inline": no_mutual,
         "astra": astra,
     }
-    suite = ROOT / "v1/benchmarks/suite.tsv"
+    suite = ROOT / "v1/benchmarks/suite-original.tsv"
     tasks = [line.split()[2] for line in suite.read_text().splitlines() if line and not line.startswith("#")]
     reports = {}
     # Run timings sequentially to avoid interference between our own benchmark workers.

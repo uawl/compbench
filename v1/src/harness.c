@@ -453,8 +453,8 @@ static int report(const char *path, const Task *tasks, const Result *results,
     json_string(f, suite);
     fprintf(f, ",\n  ");
     fprintf(f, "\"schema_version\": 2,\n  \"seed\": %" PRIu64 ",\n  \"passed\": %d,\n  \"total\": %d,\n  \"score\": ", seed, passed, count);
-    if (passed == count) fprintf(f, "%.6f", score); else fprintf(f, "null");
-    fprintf(f, ",\n  \"tasks\": [\n");
+    fprintf(f, "%.6f", score);
+    fprintf(f, ",\n  \"score_policy\": \"geomean_failures_as_1\",\n  \"failure_speedup\": 1.0,\n  \"tasks\": [\n");
     for (int i = 0; i < count; ++i) {
         const Result *r = &results[i];
         fprintf(f, "    {\"name\": "); json_string(f, tasks[i].name);
@@ -536,9 +536,9 @@ int main(int argc, char **argv) {
         } else printf("FAIL L%d %-24s %s\n", tasks[i].level, tasks[i].name, results[i].error);
         fflush(stdout);
     }
+    /* Failed tasks contribute log(1.0) = 0 and remain in count. */
     double score = exp(sum_log / count);
-    if (passed == count) printf("%d/%d passed; geometric mean speedup: %.3fx\n", passed, count, score);
-    else printf("%d/%d passed; score withheld\n", passed, count);
+    printf("%d/%d passed; geometric mean speedup (failures=1x): %.3fx\n", passed, count, score);
     int ok = !output || report(output, tasks, results, count, seed, passed, score, suite);
     if (keep) printf("Artifacts: %s\n", directory); else cleanup(directory);
     free(tasks); free(results);

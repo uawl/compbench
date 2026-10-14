@@ -27,7 +27,7 @@ def command(args):
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     summary = json.loads((ANALYSIS / "summary.json").read_text())
-    tasks = [line.split()[2] for line in (ROOT / "v1/benchmarks/suite.tsv").read_text().splitlines()
+    tasks = [line.split()[2] for line in (ROOT / "v1/benchmarks/suite-original.tsv").read_text().splitlines()
              if line and not line.startswith("#")]
     result = {"variants": {}, "original_source_unchanged": False}
     original = ROOT / "res/v1/gemini-3.8-flash-exp-a.c"

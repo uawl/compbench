@@ -1,0 +1,6 @@
+; Odd factors keep the product informative under u64 wraparound.
+(program
+  (fn main () (call fold 0 1))
+  (fn fold (i acc)
+    (if (eq i len) acc
+      (call fold (add i 1) (mul acc (or (get i) 1))))))

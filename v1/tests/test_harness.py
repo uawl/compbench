@@ -24,7 +24,8 @@ class HarnessTests(unittest.TestCase):
                          "--output", str(output), "--seed", "12345")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             report = json.loads(output.read_text())
-            self.assertEqual(report["passed"], 8)
+            self.assertEqual(report["passed"], 26)
+            self.assertEqual(report["total"], 26)
             self.assertEqual(report["seed"], 12345)
             self.assertEqual(report["benchmark_version"], "v1")
             self.assertGreater(report["score"], 0)
@@ -61,7 +62,7 @@ class HarnessTests(unittest.TestCase):
             xs = (ctypes.c_uint64 * 3)(99, 1, 2)
             self.assertEqual(native(xs, 3), 0)
 
-    def test_failures_are_reported_and_score_is_withheld(self):
+    def test_failures_are_reported_and_score_is_neutral(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             manifest = directory / "suite.tsv"
@@ -82,7 +83,7 @@ class HarnessTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     report = json.loads(output.read_text())
                     self.assertEqual(report["passed"], 0)
-                    self.assertIsNone(report["score"])
+                    self.assertEqual(report["score"], 1.0)
                     self.assertIn(expected_error, report["tasks"][0]["error"])
 
     def test_invalid_ast_and_cli(self):

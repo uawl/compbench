@@ -1,0 +1,6 @@
+; Four steps discard the previous accumulator because 4 * 17 >= 64.
+(program
+  (fn main () (call fold 0 17))
+  (fn fold (i acc)
+    (if (eq i len) acc
+      (call fold (add i 1) (xor (shl acc 17) (get i))))))

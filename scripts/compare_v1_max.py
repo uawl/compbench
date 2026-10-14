@@ -29,7 +29,7 @@ def main():
         "gemini_no_right_spine": replace_once(gemini,
             "if (detect_right_spine_recursion(s.fn, fn_idx, &s.right_spine_op, &rs_ident))", "if (0)"),
     }
-    suite = ROOT / "v1/benchmarks/suite.tsv"
+    suite = ROOT / "v1/benchmarks/suite-original.tsv"
     tasks = [line.split()[2] for line in suite.read_text().splitlines() if line and not line.startswith("#")]
     reports = {}
     for name, source in variants.items():

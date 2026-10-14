@@ -1,0 +1,6 @@
+; All three old state values must survive simultaneous argument updates.
+(program
+  (fn main () (call fold 0 1 2 3))
+  (fn fold (i a b c)
+    (if (eq i len) (xor a (add b c))
+      (call fold (add i 1) b c (add a (get i))))))

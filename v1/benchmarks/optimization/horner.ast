@@ -1,0 +1,6 @@
+; Ordered recurrence: reassociation must preserve powers and the nonzero seed.
+(program
+  (fn main () (call fold 0 17))
+  (fn fold (i acc)
+    (if (eq i len) acc
+      (call fold (add i 1) (add (mul acc 31) (get i))))))

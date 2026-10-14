@@ -1,0 +1,7 @@
+(program
+  (fn main () (call fold 0 0))
+  (fn fold (i acc)
+    (if (eq i len) acc
+      (let x (get i)
+        (call fold (add i 1)
+          (xor acc (xor (shl x (add i 65)) (shr x x))))))))

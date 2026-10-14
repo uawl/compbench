@@ -159,10 +159,10 @@ class HarnessTests(unittest.TestCase):
                     result = run("./build/v2/compbench", "--compiler", str(compiler), "--suite", str(manifest), "--output", str(output))
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     report = json.loads(output.read_text())
-                    self.assertIsNone(report["score"])
+                    self.assertEqual(report["score"], 1.0)
                     self.assertIn(expected_error, report["tasks"][0]["error"])
 
-    def test_failures_are_reported_and_score_is_withheld(self):
+    def test_failures_are_reported_and_score_is_neutral(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             manifest = directory / "suite.tsv"
@@ -183,7 +183,7 @@ class HarnessTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     report = json.loads(output.read_text())
                     self.assertEqual(report["passed"], 0)
-                    self.assertIsNone(report["score"])
+                    self.assertEqual(report["score"], 1.0)
                     self.assertIn(expected_error, report["tasks"][0]["error"])
 
     def test_invalid_ast_and_cli(self):

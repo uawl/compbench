@@ -35,7 +35,7 @@ def main():
         "argon_no_mutual_inline": replace_once(
             argon, "(caller_idx < cid && csize <= 40)", "(0)"),
     }
-    suite = ROOT / "v1/benchmarks/suite.tsv"
+    suite = ROOT / "v1/benchmarks/suite-original.tsv"
     tasks = [line.split()[2] for line in suite.read_text().splitlines()
              if line and not line.startswith("#")]
     reports = {}

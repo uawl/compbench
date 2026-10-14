@@ -2,7 +2,7 @@ CC ?= cc
 CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wpedantic -Werror
 LDLIBS += -ldl -lm
 
-.PHONY: all v1 v2 test test-v1 test-v2 demo demo-v1 demo-v2 prompt prompt-v1 prompt-v2 evaluate-v1 evaluate-v2 charts charts-v1 charts-v2 clean
+.PHONY: all v1 v2 test test-v1 test-v2 test-optimizations demo demo-v1 demo-v2 prompt prompt-v1 prompt-v2 evaluate-v1 evaluate-v2 charts charts-v1 charts-v2 clean
 all: v1 v2
 v1: build/v1/compbench build/v1/baseline-compiler
 v2: build/v2/compbench build/v2/baseline-compiler
@@ -40,8 +40,14 @@ endef
 $(eval $(call VERSION_RULES,v1))
 $(eval $(call VERSION_RULES,v2))
 
+test-v1: test-optimizations
+
+test-optimizations: v1
+	python3 v1/tests/test_optimizations.py
+
 test: test-v1 test-v2
 	python3 tests/test_versions.py
+	python3 tests/test_scoring.py
 
 demo: demo-v2
 prompt: prompt-v1 prompt-v2

@@ -1,0 +1,7 @@
+; The last window includes an out-of-bounds element, whose value is zero.
+(program
+  (fn main () (call fold 0 0))
+  (fn fold (i acc)
+    (if (eq i len) acc
+      (call fold (add i 1)
+        (add acc (xor (get i) (get (add i 1))))))))

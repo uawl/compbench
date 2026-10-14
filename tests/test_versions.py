@@ -46,7 +46,7 @@ class VersionTests(unittest.TestCase):
                 self.assertEqual(data["entry_abi"], "u64(xs,n)" if version == "v1" else "u64(xs,n,arena)")
                 self.assertEqual(data["baseline"], f"{version}/src/codegen.c")
                 if version == "v1":
-                    self.assertIsNone(data["score"])
+                    self.assertEqual(data["score"], 1.0)
                     self.assertIn("unknown operation", data["tasks"][0]["error"])
                 else:
                     self.assertEqual(data["passed"], 1)
@@ -65,6 +65,20 @@ class VersionTests(unittest.TestCase):
                          "--output-dir", str(directory / "figures"), "--no-analysis")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("different benchmark_version", result.stderr)
+
+    @unittest.skipUnless(importlib.util.find_spec("matplotlib") and importlib.util.find_spec("numpy"),
+                         "Optional chart dependencies are not installed")
+    def test_graph_rejects_different_suite_sizes_without_task_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for total in (8, 26):
+                data = {"benchmark_version": "v1", "passed": 0, "total": total,
+                        "status": "compile_failure", "score": 1, "tasks": []}
+                (directory / f"model_{total}.json").write_text(json.dumps(data))
+            result = run("python3", "scripts/render_results.py", "--input-dir", str(directory),
+                         "--output-dir", str(directory / "figures"), "--no-analysis")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("different total", result.stderr)
 
 
 if __name__ == "__main__":

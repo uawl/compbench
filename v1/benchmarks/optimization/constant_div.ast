@@ -1,0 +1,5 @@
+(program
+  (fn main () (call fold 0 0))
+  (fn fold (i acc)
+    (if (eq i len) acc
+      (call fold (add i 1) (add acc (div (get i) 7))))))

@@ -1,0 +1,6 @@
+(program
+  (fn main () (call fold 0 18446744073709551615))
+  (fn fold (i acc)
+    (if (eq i len) acc
+      (let x (get i)
+        (call fold (add i 1) (if (lt x acc) x acc))))))

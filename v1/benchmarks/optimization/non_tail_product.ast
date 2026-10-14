@@ -1,0 +1,5 @@
+(program
+  (fn main () (call fold 0))
+  (fn fold (i)
+    (if (eq i len) 1
+      (mul (or (get i) 1) (call fold (add i 1))))))

@@ -1,0 +1,20 @@
+# Optimization subset of the regular scalar benchmark.
+# difficulty  timing-array-length  AST (relative to this file)
+2 8192 optimization/product.ast
+2 8192 optimization/unsigned_min.ast
+3 8192 optimization/horner.ast
+3 8192 optimization/horner_invariant.ast
+3 8192 optimization/shift_xor.ast
+3 8192 optimization/shift_xor_wide.ast
+2 8192 optimization/constant_div.ast
+2 8192 optimization/constant_mod.ast
+2 8192 optimization/variable_div.ast
+2 8192 optimization/variable_mod.ast
+2 8192 optimization/offset_window.ast
+3 8192 optimization/indexed_gather.ast
+3 8192 optimization/three_accumulators.ast
+3 8192 optimization/tail_rotation.ast
+4 32 optimization/non_tail_product.ast
+4 32 optimization/non_associative_sub.ast
+3 8192 optimization/helper_cse.ast
+3 8192 optimization/variable_shift.ast

@@ -9,6 +9,8 @@ import shlex
 import subprocess
 import sys
 
+from scoring import apply_score
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -22,6 +24,7 @@ def main(version=None):
     version = version or args.version
     directory = ROOT / version
     suite = directory / "benchmarks/suite.tsv"
+    suite_sha256 = hashlib.sha256(suite.read_bytes()).hexdigest()
     total = sum(bool(line.strip()) and not line.lstrip().startswith("#") for line in suite.read_text().splitlines())
     sources = sorted((ROOT / "res" / version).glob("*.c"))
     if args.names:
@@ -47,6 +50,7 @@ def main(version=None):
             "benchmark_version": version,
             "entry_abi": "u64(xs,n)" if version == "v1" else "u64(xs,n,arena)",
             "suite": f"{version}/benchmarks/suite.tsv",
+            "suite_sha256": suite_sha256,
             "baseline": f"{version}/src/codegen.c",
             "harness": ("v1 scalar harness (two-argument ABI)" if version == "v1"
                         else "v2 list harness (three-argument ABI)"),
@@ -56,6 +60,7 @@ def main(version=None):
         def failure_report(status, message, returncode=None):
             report = {"schema_version": 2, "status": status, "passed": 0, "total": total,
                       "score": None, "tasks": [], "error": message, **provenance}
+            apply_score(report)
             if returncode is not None:
                 report["compile_returncode"] = returncode
             report_path.write_text(json.dumps(report, indent=2) + "\n")
@@ -99,6 +104,7 @@ def main(version=None):
             report = json.loads(report_path.read_text())
             report.update(provenance)
             report["status"] = "pass" if evaluation.returncode == 0 else "fail"
+            apply_score(report)
             report_path.write_text(json.dumps(report, indent=2) + "\n")
         else:
             failure_report("evaluation_error", "Harness did not produce a report")

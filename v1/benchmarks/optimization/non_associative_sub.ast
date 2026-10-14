@@ -1,0 +1,6 @@
+; Subtraction cannot use the same accumulator transformation as addition.
+(program
+  (fn main () (call fold 0))
+  (fn fold (i)
+    (if (eq i len) 0
+      (sub (get i) (call fold (add i 1))))))

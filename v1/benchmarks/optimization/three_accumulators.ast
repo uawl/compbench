@@ -1,0 +1,6 @@
+(program
+  (fn main () (call fold 0 0 0 1))
+  (fn fold (i total bits prod)
+    (if (eq i len) (xor total (add bits prod))
+      (let x (xor (get i) (shr (get i) 7))
+        (call fold (add i 1) (add total x) (xor bits x) (mul prod (or x 1)))))))

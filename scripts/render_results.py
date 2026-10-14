@@ -9,6 +9,8 @@ from pathlib import Path
 import sys
 import textwrap
 
+from scoring import geometric_score
+
 try:
     import matplotlib
     matplotlib.use("Agg")
@@ -95,12 +97,7 @@ def validate_report(data, path):
 
 
 def score(data):
-    tasks = data["tasks"]
-    if (data.get("status") in {"compile_failure", "evaluation_error", "fail"}
-            or data.get("passed") != data.get("total") or not tasks
-            or len(tasks) != data.get("total") or any(t.get("status") != "pass" for t in tasks)):
-        return None
-    return data["score"] if positive(data.get("score")) else None
+    return geometric_score(data)
 
 
 def task_speedup(data, name):
@@ -120,7 +117,7 @@ def read_models(directory):
         values = {str(m["data"].get(field, "legacy")) for m in models}
         if len(values) > 1:
             raise ValueError(f"Reports have different {field} values; render them separately")
-    for field in ("suite", "baseline", "seed", "harness"):
+    for field in ("suite", "suite_sha256", "total", "baseline", "seed", "harness"):
         values = {str(m["data"][field]) for m in models if m["data"].get(field) is not None}
         if len(values) > 1:
             raise ValueError(f"Reports have different {field} values; render them separately")
@@ -172,14 +169,26 @@ def diagnostic_note(models, analysis):
 
 def draw_models(models, tasks, analysis, args):
     n = len(models)
-    width = max(15, len(tasks) * 1.42 + 3)
-    height = max(9.4, 6.5 + n * .95)
+    bands = max(1, math.ceil(len(tasks) / args.columns))
+    columns = max(1, math.ceil(len(tasks) / bands))
+    groups = [tasks[i:i + columns] for i in range(0, len(tasks), columns)] or [[]]
+    width = max(15, columns * 1.25 + 3)
+    overall_height = max(1.3, n * .4 + .25)
+    heat_height = max(1., n * .42)
+    heights = [overall_height] + [heat_height] * len(groups)
+    header, footer, gap = 2.25, 1.6, 1.05
+    height = header + sum(heights) + gap * len(groups) + footer
     fig = plt.figure(figsize=(width, height), facecolor=PAPER)
     total = max(m["data"].get("total", 0) for m in models)
-    title(fig, args.title, f"{n} submissions  /  {total} tasks  /  speedup vs scalar baseline · higher is better",
-          "COMPBENCH   /   MODEL COMPARISON")
-    grid = fig.add_gridspec(2, 1, left=.20, right=.94, top=.80, bottom=.17,
-                           height_ratios=[1, 1.18], hspace=.58)
+    # Physical margins keep headings and footnotes readable as heatmap rows grow.
+    fig.text(.065, 1 - .40 / height, "COMPBENCH   /   MODEL COMPARISON", fontsize=11, color=TEAL, weight="bold")
+    fig.text(.065, 1 - .90 / height, args.title, fontsize=28, color=INK, weight="bold")
+    fig.text(.065, 1 - 1.25 / height,
+             f"{n} submissions  /  {total} tasks  /  speedup vs scalar baseline · higher is better",
+             fontsize=11, color=MUTED)
+    grid = fig.add_gridspec(len(heights), 1, left=.20, right=.94,
+                           top=1 - header / height, bottom=footer / height,
+                           height_ratios=heights, hspace=gap / (sum(heights) / len(heights)))
     ax = fig.add_subplot(grid[0])
     clean_axis(ax)
     values = [score(m["data"]) for m in models]
@@ -194,7 +203,7 @@ def draw_models(models, tasks, analysis, args):
     ax.grid(axis="x", color=GRID, linewidth=.8)
     ax.axvline(1, color=MUTED, linestyle=(0, (3, 3)), linewidth=1.1, zorder=2)
     ax.set_title("Overall performance", loc="left", fontsize=16, weight="bold", color=INK, pad=25)
-    ax.text(0, 1.03, "Geometric mean across all tasks · score withheld when any task fails",
+    ax.text(0, 1.03, "Geometric mean across all tasks · each failed task contributes 1.0×",
             transform=ax.transAxes, fontsize=10, color=MUTED)
     for i, (model, value) in enumerate(zip(models, values)):
         if value is None:
@@ -205,13 +214,7 @@ def draw_models(models, tasks, analysis, args):
         passed = model["data"].get("passed", 0)
         ax.text(1.012, i, f"{passed}/{model['data'].get('total', '?')} pass", transform=ax.get_yaxis_transform(),
                 va="center", fontsize=10, color=MUTED)
-    heat = fig.add_subplot(grid[1])
-    clean_axis(heat)
-    heat.set_title("Where the speed comes from", loc="left", fontsize=16, weight="bold", color=INK, pad=27)
-    if not tasks:
-        heat.axis("off")
-        heat.text(.5, .5, "No task timings available", transform=heat.transAxes, ha="center", color=MUTED)
-    else:
+    if tasks:
         matrix = np.array([[task_speedup(m["data"], t) or np.nan for t in tasks] for m in models], dtype=float)
         logs = np.ma.masked_invalid(np.log2(matrix))
         finite = logs.compressed()
@@ -220,26 +223,44 @@ def draw_models(models, tasks, analysis, args):
         cmap = LinearSegmentedColormap.from_list("compbench", ["#c86c61", "#f0f3e9", "#146c61"])
         cmap.set_bad("#edf0ec")
         norm = TwoSlopeNorm(vmin=lower, vcenter=0, vmax=upper)
-        rendered = heat.imshow(logs, cmap=cmap, norm=norm, aspect="auto")
+    offset = 0
+    for band, group in enumerate(groups):
+        heat = fig.add_subplot(grid[band + 1])
+        clean_axis(heat)
+        heading = "Where the speed comes from"
+        if len(groups) > 1:
+            heading += f"  ·  {offset + 1}–{offset + len(group)} / {len(tasks)}"
+        heat.set_title(heading, loc="left", fontsize=16, weight="bold", color=INK, pad=22)
+        if not group:
+            heat.axis("off")
+            heat.text(.5, .5, "No task timings available", transform=heat.transAxes, ha="center", color=MUTED)
+            continue
+        # Keep column widths aligned when the last row has fewer benchmarks.
+        position = heat.get_position()
+        heat.set_position([position.x0, position.y0, position.width * len(group) / columns, position.height])
+        end = offset + len(group)
+        rendered = heat.imshow(logs[:, offset:end], cmap=cmap, norm=norm, aspect="auto")
         heat.set_yticks(np.arange(n), [m["label"] for m in models], fontsize=10, color=INK)
-        labels = [TASK_LABELS.get(Path(t).stem, textwrap.fill(Path(t).stem.replace("_", " "), 13)) for t in tasks]
-        heat.set_xticks(np.arange(len(tasks)), labels, fontsize=10)
-        heat.set_xticks(np.arange(-.5, len(tasks), 1), minor=True)
+        labels = [TASK_LABELS.get(Path(t).stem, textwrap.fill(Path(t).stem.replace("_", " "), 13)) for t in group]
+        heat.set_xticks(np.arange(len(group)), labels, fontsize=10)
+        heat.set_xticks(np.arange(-.5, len(group), 1), minor=True)
         heat.set_yticks(np.arange(-.5, n, 1), minor=True)
         heat.grid(which="minor", color="white", linewidth=3)
         heat.tick_params(which="minor", length=0)
         for i, model in enumerate(models):
             rows = {t["name"]: t for t in model["data"]["tasks"]}
-            for j, task in enumerate(tasks):
-                value = matrix[i, j]
+            for j, task in enumerate(group):
+                value = matrix[i, offset + j]
                 if np.isfinite(value):
                     rgb = cmap(norm(math.log2(value)))[:3]
                     luminance = sum(v * w for v, w in zip(rgb, (.2126, .7152, .0722)))
                     heat.text(j, i, f"{value:.1f}×", ha="center", va="center", fontsize=12, weight="bold",
                               color="white" if luminance < .54 else INK)
                 else:
-                    heat.text(j, i, "FAIL" if task in rows else "—", ha="center", va="center", color=MUTED, fontsize=11)
-        bar_ax = fig.add_axes([.20, .087, .42, .014])
+                    heat.text(j, i, "FAIL\n(1×)" if task in rows else "—", ha="center", va="center", color=MUTED, fontsize=11)
+        offset = end
+    if tasks:
+        bar_ax = fig.add_axes([.20, .90 / height, .42, .14 / height])
         powers = np.arange(lower, upper + 1)
         if len(powers) > 10:
             powers = powers[::2]
@@ -247,10 +268,10 @@ def draw_models(models, tasks, analysis, args):
         bar.outline.set_visible(False)
         bar.ax.set_xticklabels([f"{2 ** p:g}×" for p in powers])
         bar.ax.tick_params(length=0, labelsize=9, colors=MUTED)
-        fig.text(.65, .087, "Log color scale  /  1× = baseline\n— not measured  ·  FAIL failed task",
+        fig.text(.65, .95 / height, "Log color scale  /  1× = baseline\n— not measured  ·  failed tasks score as 1×",
                  fontsize=9, color=MUTED, va="center")
-    fig.text(.065, .032, diagnostic_note(models, analysis), fontsize=9, color=MUTED)
-    fig.text(.065, .014, "Median of 7 samples · timings include call overhead · small differences may be measurement noise.",
+    fig.text(.065, .36 / height, diagnostic_note(models, analysis), fontsize=9, color=MUTED)
+    fig.text(.065, .15 / height, "Median of 7 samples · timings include call overhead · small differences may be measurement noise.",
              fontsize=8, color=MUTED)
     return save(fig, "model-comparison", args.output_dir, args.formats, args.dpi)
 
@@ -310,7 +331,7 @@ def draw_optimizations(analysis, args):
     detail.set_xticks(x, [Path(t).stem.replace("_", " ") for t in tasks], rotation=55, ha="right", fontsize=9)
     detail.set_title("Per-task profile", loc="left", fontsize=16, color=INK, weight="bold", pad=22)
     detail.legend(loc="upper right", frameon=False, fontsize=9)
-    fig.text(.065, .105, "Variants are independent comparisons. Their gains are not additive.", fontsize=10, color=MUTED)
+    fig.text(.065, .105, "Each failed task scores as 1×. Variant gains are independent and not additive.", fontsize=10, color=MUTED)
     probe = analysis.get("constant_fold_probe", {}).get("gemini_full", {})
     if probe.get("passed", 1) < probe.get("total", 1):
         fig.text(.065, .068, "Accuracy note: Gemini fails the separate constant-folding probe (2 + 3 → 0).", fontsize=10, color="#a8564e")
@@ -329,12 +350,15 @@ def main():
     parser.add_argument("--formats", nargs="+", choices=("png", "svg", "pdf"), default=["png", "svg"])
     parser.add_argument("--dpi", type=int, default=180)
     parser.add_argument("--title")
+    parser.add_argument("--columns", type=int, default=9, help="Maximum benchmarks per heatmap row (default: 9)")
     args = parser.parse_args()
     args.input_dir = args.input_dir or ROOT / "build/res" / args.version
     args.output_dir = args.output_dir or ROOT / "build/figures" / args.version
     args.title = args.title or f"Recursive codegen · {args.version}"
     if not 72 <= args.dpi <= 600:
         parser.error("--dpi must be between 72 and 600")
+    if args.columns < 1:
+        parser.error("--columns must be at least 1")
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11, "text.color": INK,
                          "axes.labelcolor": MUTED, "svg.fonttype": "path", "pdf.fonttype": 42,
                          "axes.unicode_minus": True})
@@ -352,8 +376,12 @@ def main():
                     candidate = read_json(automatic)
                     # Historical measurements retain their original ABI/provenance.
                     variants = list(candidate.get("variants", {}).values())
+                    model_tasks = {task["name"] for task in models[0]["data"]["tasks"]}
                     if variants and all(r.get("benchmark_version") == models[0]["data"].get("benchmark_version")
-                                        and r.get("harness") == models[0]["data"].get("harness") for r in variants):
+                                        and r.get("harness") == models[0]["data"].get("harness")
+                                        and r.get("total") == models[0]["data"].get("total")
+                                        and {task["name"] for task in r.get("tasks", [])} == model_tasks
+                                        for r in variants):
                         analysis = candidate
         args.output_dir.mkdir(parents=True, exist_ok=True)
         draw_models(models, tasks, analysis, args)

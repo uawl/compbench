@@ -1,0 +1,7 @@
+; Short inputs exercise valid and invalid indices in the same vector group.
+(program
+  (fn main () (call fold 0 0))
+  (fn fold (i acc)
+    (if (eq i len) acc
+      (call fold (add i 1)
+        (add acc (get (and (mul i 17) 1023)))))))

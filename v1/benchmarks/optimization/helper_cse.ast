@@ -1,0 +1,9 @@
+; Inlining exposes repeated, nontrivial expressions within each iteration.
+(program
+  (fn main () (call fold 0 0))
+  (fn mix (x)
+    (add (mul (xor x (shr x 13)) 11400714819323198485)
+         (mul (xor x (shr x 13)) 11400714819323198485)))
+  (fn fold (i acc)
+    (if (eq i len) acc
+      (call fold (add i 1) (add acc (call mix (get i)))))))
